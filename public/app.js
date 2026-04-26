@@ -1,24 +1,60 @@
 const $ = sel => document.querySelector(sel);
 const state = { projects: [], current: null, snapshot: null, dir: '.', file: 'README.md', tab: 'loop', rendering: false };
+const CLIENT_SESSION = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
-async function api(path, opts) {
-  const res = await fetch(path, opts);
-  const type = res.headers.get('content-type') || '';
-  const body = type.includes('json') ? await res.json() : await res.text();
-  if (!res.ok) throw new Error(body.error || body);
-  return body;
+function scrubClient(value, depth = 0) {
+  if (depth > 3) return '[depth-limit]';
+  if (value == null || typeof value === 'number' || typeof value === 'boolean') return value;
+  if (typeof value === 'string') return value.length > 400 ? `${value.slice(0, 400)}…truncated(${value.length})` : value;
+  if (Array.isArray(value)) return value.slice(0, 20).map(v => scrubClient(v, depth + 1));
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    out[k] = /token|secret|password|authorization|cookie|key/i.test(k) ? '[redacted]' : scrubClient(v, depth + 1);
+  }
+  return out;
 }
+async function clientLog(event, details = {}, level = 'info') {
+  const payload = { ts: new Date().toISOString(), level, event, session: CLIENT_SESSION, path: location.pathname, details: scrubClient(details) };
+  try {
+    const body = JSON.stringify(payload);
+    if (navigator.sendBeacon) {
+      const ok = navigator.sendBeacon('/api/client-log', new Blob([body], { type: 'application/json' }));
+      if (ok) return;
+    }
+    await fetch('/api/client-log', { method:'POST', headers:{'content-type':'application/json'}, body, keepalive: true });
+  } catch {}
+}
+async function api(path, opts = {}) {
+  const started = performance.now();
+  const method = opts.method || 'GET';
+  clientLog('api.request.start', { method, path });
+  try {
+    const res = await fetch(path, opts);
+    const type = res.headers.get('content-type') || '';
+    const body = type.includes('json') ? await res.json() : await res.text();
+    clientLog('api.request.finish', { method, path, status: res.status, durationMs: Math.round(performance.now() - started) }, res.ok ? 'info' : 'error');
+    if (!res.ok) throw new Error(body.error || body);
+    return body;
+  } catch (e) {
+    clientLog('api.request.error', { method, path, durationMs: Math.round(performance.now() - started), error: e.message }, 'error');
+    throw e;
+  }
+}
+window.addEventListener('error', e => clientLog('window.error', { message: e.message, source: e.filename, line: e.lineno, col: e.colno, stack: e.error?.stack }, 'error'));
+window.addEventListener('unhandledrejection', e => clientLog('window.unhandledrejection', { reason: e.reason?.message || String(e.reason), stack: e.reason?.stack }, 'error'));
 function esc(s='') { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function qs(p) { return new URLSearchParams(p).toString(); }
 function currentProject() { return state.projects.find(p => p.key === state.current); }
 function scoreClass(score) { return score >= 80 ? 'good' : score >= 50 ? 'warn' : 'bad'; }
 
 async function init() {
+  clientLog('ui.init.start', { userAgent: navigator.userAgent });
   try { const h = await api('/api/health'); $('#health').textContent = h.version; $('#health').className = 'pill good'; } catch { $('#health').textContent = 'offline'; $('#health').className = 'pill bad'; }
   $('#refresh').onclick = refreshCurrent;
   $('#addProject').onsubmit = addProject;
   await loadProjects();
   if (state.projects[0]) selectProject(state.projects[0].key);
+  clientLog('ui.init.complete', { projectCount: state.projects.length, current: state.current });
 }
 async function loadProjects() {
   const data = await api('/api/projects'); state.projects = data.projects || [];
@@ -31,13 +67,13 @@ async function addProject(e) {
   const item = await api('/api/projects', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ name: fd.get('name'), repoPath: fd.get('repoPath') }) });
   e.target.reset(); await loadProjects(); selectProject(item.key);
 }
-async function selectProject(key) { state.current = key; state.dir='.'; state.file='README.md'; await loadProjects(); await refreshCurrent(); }
+async function selectProject(key) { clientLog('ui.project.select', { key }); state.current = key; state.dir='.'; state.file='README.md'; await loadProjects(); await refreshCurrent(); }
 async function refreshCurrent() {
   const p = currentProject(); if (!p || state.rendering) return;
   try { state.snapshot = await api(`/api/project?${qs({host:p.host, repoPath:p.repoPath})}`); renderDashboard(); }
   catch (e) { $('#dashboard').innerHTML = `<div class="card"><h2>Error</h2><p>${esc(e.message)}</p></div>`; }
 }
-function setTab(tab) { state.tab = tab; renderDashboard(); }
+function setTab(tab) { clientLog('ui.tab.select', { tab }); state.tab = tab; renderDashboard(); }
 
 function renderDashboard() {
   state.rendering = true;
@@ -149,12 +185,15 @@ function renderHistory() {
 }
 async function saveConfig(e) {
   e.preventDefault();
+  clientLog('ui.config.save.start', { current: state.current });
   const p = currentProject(), fd = new FormData(e.target);
   state.snapshot.loop = await api('/api/config', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, intent: fd.get('intent'), model: fd.get('model'), overseerPrompt: fd.get('overseerPrompt'), supervisorPrompt: fd.get('supervisorPrompt'), variantCount: fd.get('variantCount'), agentId: fd.get('agentId') }) });
   await refreshCurrent();
+  clientLog('ui.config.save.complete', { current: state.current });
 }
 async function startAgent() {
   const p = currentProject();
+  clientLog('ui.agent.start.clicked', { project: p?.key });
   const f = $('#intentForm');
   const fd = f ? new FormData(f) : new FormData();
   try {
@@ -163,7 +202,8 @@ async function startAgent() {
     localStorage.setItem('openclawAgentToken', token);
     await api('/api/agent/start', { method:'POST', headers:{'content-type':'application/json', 'x-agent-token': token}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, message: fd.get('intent') || state.snapshot.loop.intent, agentId: fd.get('agentId') || '' }) });
     await refreshCurrent();
-  } catch (e) { alert(e.message); }
+    clientLog('ui.agent.start.complete', { project: p?.key });
+  } catch (e) { clientLog('ui.agent.start.error', { error: e.message }, 'error'); alert(e.message); }
 }
 function agentRuns(runs=[]) {
   if (!runs.length) return '<p class="muted">No real OpenClaw agent runs yet. Use “Start real agent” to launch one from the current intent.</p>';
@@ -171,8 +211,9 @@ function agentRuns(runs=[]) {
 }
 async function runStep() {
   const p = currentProject();
-  try { state.snapshot.loop = await api('/api/step', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath }) }); await refreshCurrent(); }
-  catch (e) { alert(e.message); }
+  clientLog('ui.loop.step.clicked', { project: p?.key, stage: state.snapshot?.loop?.stage });
+  try { state.snapshot.loop = await api('/api/step', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath }) }); await refreshCurrent(); clientLog('ui.loop.step.complete', { project: p?.key, stage: state.snapshot?.loop?.stage }); }
+  catch (e) { clientLog('ui.loop.step.error', { error: e.message }, 'error'); alert(e.message); }
 }
 async function loadBrowser() {
   const p = currentProject();
@@ -191,4 +232,4 @@ async function loadFile() {
   catch(e) { pre.textContent = e.message; }
 }
 
-init().catch(e => { document.body.innerHTML = `<pre>${esc(e.stack || e.message)}</pre>`; });
+init().catch(e => { clientLog('ui.init.error', { error: e.message, stack: e.stack }, 'error'); document.body.innerHTML = `<pre>${esc(e.stack || e.message)}</pre>`; });
