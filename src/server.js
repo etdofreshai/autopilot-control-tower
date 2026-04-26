@@ -204,8 +204,9 @@ async function startAgentRun(host, repoPath, body = {}) {
   child.stderr.on('data', d => { err += d; appendRunLog(id, d).catch(()=>{}); });
   child.on('error', e => updateAgentRun(key, id, { status: 'failed', error: String(e), completedAt: now() }).catch(()=>{}));
   child.on('close', rc => {
-    const parsed = parseOpenClawJson(out);
-    const reply = openClawReply(parsed, out);
+    const combined = `${out}\n${err}`;
+    const parsed = parseOpenClawJson(combined);
+    const reply = openClawReply(parsed, combined);
     updateAgentRun(key, id, { status: rc === 0 ? 'succeeded' : 'failed', rc, completedAt: now(), output: shortText(reply, 6000), error: shortText(err, 3000), rawJson: parsed ? parsed : undefined }).catch(()=>{});
   });
   return entry;
