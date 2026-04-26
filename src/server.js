@@ -214,9 +214,30 @@ function parseOpenClawJson(out) {
   }
   return fallback;
 }
+function textFromPayloads(payloads) {
+  return Array.isArray(payloads) ? payloads.map(p => p?.text).filter(Boolean).join('\n\n') : '';
+}
+function stringifyReplyValue(value) {
+  if (!value) return '';
+  if (typeof value === 'string') return value;
+  const nested = openClawReply(value, '');
+  if (nested) return nested;
+  try { return JSON.stringify(value, null, 2); } catch { return String(value); }
+}
 function openClawReply(parsed, out) {
-  const payloadText = Array.isArray(parsed?.payloads) ? parsed.payloads.map(p => p?.text).filter(Boolean).join('\n\n') : '';
-  return payloadText || parsed?.reply || parsed?.text || parsed?.message || parsed?.result || parsed?.finalAssistantVisibleText || parsed?.finalAssistantRawText || parsed?.data?.finalAssistantVisibleText || parsed?.turn?.finalAssistantVisibleText || out;
+  const payloadText = textFromPayloads(parsed?.payloads) || textFromPayloads(parsed?.result?.payloads) || textFromPayloads(parsed?.data?.payloads);
+  return payloadText
+    || parsed?.finalAssistantVisibleText
+    || parsed?.finalAssistantRawText
+    || parsed?.data?.finalAssistantVisibleText
+    || parsed?.data?.finalAssistantRawText
+    || parsed?.turn?.finalAssistantVisibleText
+    || parsed?.turn?.finalAssistantRawText
+    || parsed?.reply
+    || parsed?.text
+    || parsed?.message
+    || stringifyReplyValue(parsed?.result)
+    || out;
 }
 async function appendRunLog(id, chunk) { await fs.mkdir(AGENT_RUNS_DIR, { recursive: true }); await fs.appendFile(path.join(AGENT_RUNS_DIR, `${id}.log`), chunk); }
 async function updateAgentRun(projectKeyValue, id, patch) {

@@ -29,6 +29,12 @@
       "repoPath": "/openclaw/.openclaw/tmp/md-to-html-preview",
       "name": "Markdown to HTML converter",
       "key": "dokploy:/openclaw/.openclaw/tmp/md-to-html-preview"
+    },
+    {
+      "host": "dokploy",
+      "repoPath": "/openclaw/.openclaw/tmp/trailmix",
+      "name": "Trailmix",
+      "key": "dokploy:/openclaw/.openclaw/tmp/trailmix"
     }
   ]
 }
