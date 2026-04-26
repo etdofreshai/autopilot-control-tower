@@ -355,6 +355,12 @@ async function scanProject(host, repoPath) {
   const key = projectKey(host, repo);
   if (!(await exists(repo))) return { key, host, repoPath: repo, missing: true, canCreate: canCreateRepo(repo), message: 'This project path does not exist yet.' };
   const state = normalizedLoop(await loadState(), key);
+  const runs = state.agentRuns || [];
+  if (state.status === 'agent running' && runs.length && !runs.some(r => r.status === 'running')) {
+    const latest = runs[0];
+    state.status = latest.status === 'succeeded' ? 'agent completed' : 'agent failed';
+    state.stage = latest.status === 'succeeded' ? 'evaluate' : 'subagents';
+  }
   return { key, host, repoPath: repo, missing: false, git: await gitStatus(repo), loop: state, stages: loopCards(state) };
 }
 function canCreateRepo(repo) {
