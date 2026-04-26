@@ -7,32 +7,34 @@ import path from 'node:path';
 
 const PORT = 18787;
 let cp;
+let dataDir;
 async function start(extraEnv = {}) {
-  cp = spawn(process.execPath, ['src/server.js'], { env: { ...process.env, ...extraEnv, PORT: String(PORT) }, stdio: ['ignore', 'pipe', 'pipe'] });
+  dataDir = extraEnv.DATA_DIR || await mkdtemp(path.join(tmpdir(), 'act-data-'));
+  cp = spawn(process.execPath, ['src/server.js'], { env: { ...process.env, DATA_DIR: dataDir, ...extraEnv, PORT: String(PORT) }, stdio: ['ignore', 'pipe', 'pipe'] });
   await new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error('server start timeout')), 3000);
     cp.stdout.on('data', d => { if (String(d).includes('listening')) { clearTimeout(t); resolve(); } });
     cp.on('exit', code => reject(new Error('server exited ' + code)));
   });
 }
-async function stop() { if (cp) cp.kill('SIGTERM'); }
+async function stop() { if (cp) cp.kill('SIGTERM'); if (dataDir) await rm(dataDir, { recursive: true, force: true }); cp = undefined; dataDir = undefined; }
 async function post(path, body) {
   return fetch(`http://127.0.0.1:${PORT}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json());
 }
 
 test('health and projects endpoints', async (t) => {
   await start();
-  t.after(stop);
+  t.after(async () => { await stop(); });
   const health = await fetch(`http://127.0.0.1:${PORT}/api/health`).then(r => r.json());
   assert.equal(health.ok, true);
-  assert.match(health.version, /real-openclaw-agents/);
+  assert.match(health.version, /persistent-projects/);
   const projects = await fetch(`http://127.0.0.1:${PORT}/api/projects`).then(r => r.json());
   assert.ok(Array.isArray(projects.projects));
 });
 
 test('missing project can be created from the API', async (t) => {
   await start();
-  t.after(stop);
+  t.after(async () => { await stop(); });
   const base = await mkdtemp(path.join(tmpdir(), 'act-create-'));
   t.after(() => rm(base, { recursive: true, force: true }));
   const repoPath = path.join(base, 'md-to-html-preview');
@@ -46,7 +48,7 @@ test('missing project can be created from the API', async (t) => {
 
 test('configuring and stepping the supervisor learning loop', async (t) => {
   await start();
-  t.after(stop);
+  t.after(async () => { await stop(); });
   const projects = await fetch(`http://127.0.0.1:${PORT}/api/projects`).then(r => r.json());
   const p = projects.projects[0];
   assert.ok(p, 'seed project exists');
@@ -93,7 +95,7 @@ test('real OpenClaw agent start records async run output', async (t) => {
   await writeFile(fake, '#!/usr/bin/env node\nconsole.log(JSON.stringify({ reply: "FAKE_AGENT_OK" }));\n', 'utf8');
   await chmod(fake, 0o755);
   await start({ OPENCLAW_BIN: fake, OPENCLAW_AGENT_RUNS: '1', OPENCLAW_AGENT_TOKEN: 'test-token' });
-  t.after(stop);
+  t.after(async () => { await stop(); });
   const projects = await fetch(`http://127.0.0.1:${PORT}/api/projects`).then(r => r.json());
   const p = projects.projects[0];
   const configured = await post('/api/config', { host: p.host, repoPath: p.repoPath, intent: 'Fake agent smoke test', agentId: 'test-agent' });

@@ -53,7 +53,9 @@ async function init() {
   $('#refresh').onclick = refreshCurrent;
   $('#addProject').onsubmit = addProject;
   await loadProjects();
-  if (state.projects[0]) selectProject(state.projects[0].key);
+  const saved = localStorage.getItem('autopilot.currentProject');
+  const initial = state.projects.find(p => p.key === saved)?.key || state.projects[0]?.key;
+  if (initial) selectProject(initial);
   clientLog('ui.init.complete', { projectCount: state.projects.length, current: state.current });
 }
 async function loadProjects() {
@@ -67,7 +69,7 @@ async function addProject(e) {
   const item = await api('/api/projects', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ name: fd.get('name'), repoPath: fd.get('repoPath') }) });
   e.target.reset(); await loadProjects(); selectProject(item.key);
 }
-async function selectProject(key) { clientLog('ui.project.select', { key }); state.current = key; state.dir='.'; state.file='README.md'; await loadProjects(); await refreshCurrent(); }
+async function selectProject(key) { clientLog('ui.project.select', { key }); state.current = key; localStorage.setItem('autopilot.currentProject', key); state.dir='.'; state.file='README.md'; await loadProjects(); await refreshCurrent(); }
 async function refreshCurrent() {
   const p = currentProject(); if (!p || state.rendering) return;
   try { state.snapshot = await api(`/api/project?${qs({host:p.host, repoPath:p.repoPath})}`); renderDashboard(); }

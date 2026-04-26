@@ -8,12 +8,48 @@ import { spawn } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
-const DATA_DIR = path.join(ROOT, 'data');
+const BUNDLED_DATA_DIR = path.join(ROOT, 'data');
+function canUseDataDir(dir) {
+  try {
+    fssync.mkdirSync(dir, { recursive: true });
+    const probe = path.join(dir, '.write-test');
+    fssync.writeFileSync(probe, 'ok');
+    fssync.rmSync(probe, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+function seedPersistentDataDir(dir) {
+  try {
+    fssync.mkdirSync(dir, { recursive: true });
+    for (const file of ['projects.json', 'loop-state.json']) {
+      const src = path.join(BUNDLED_DATA_DIR, file);
+      const dest = path.join(dir, file);
+      if (!fssync.existsSync(dest) && fssync.existsSync(src)) fssync.copyFileSync(src, dest);
+    }
+  } catch {
+    // If seeding fails, normal JSON fallback/default initialization will still run.
+  }
+}
+function resolveDataDir() {
+  const candidates = [
+    process.env.DATA_DIR,
+    process.env.OPENCLAW_HOME ? path.join(process.env.OPENCLAW_HOME, '.openclaw', 'tmp', 'autopilot-control-tower', 'data') : '',
+    BUNDLED_DATA_DIR,
+  ].filter(Boolean).map(p => path.resolve(p));
+  for (const dir of candidates) {
+    if (canUseDataDir(dir)) { seedPersistentDataDir(dir); return dir; }
+  }
+  return BUNDLED_DATA_DIR;
+}
+const DATA_DIR = resolveDataDir();
 const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
 const STATE_FILE = path.join(DATA_DIR, 'loop-state.json');
 const AGENT_RUNS_DIR = path.join(DATA_DIR, 'agent-runs');
 const PORT = Number(process.env.PORT || 8787);
 const HOSTNAME = os.hostname();
+const DEFAULT_PROJECT_HOST = process.env.PROJECT_HOST || process.env.APP_HOST || (process.env.NODE_ENV === 'production' ? 'dokploy' : HOSTNAME);
 const MAX_FILE_BYTES = 512 * 1024;
 const STAGES = ['request', 'overseer', 'supervisors', 'subagents', 'evaluate', 'improve'];
 const AGENT_RUNS_ENABLED = ['1', 'true', 'yes'].includes(String(process.env.OPENCLAW_AGENT_RUNS || '').toLowerCase());
@@ -63,7 +99,7 @@ function validateProject(host, repoPath) {
 async function defaultProjects() {
   const candidates = [['/app', 'Autopilot Control Tower container'], ['/openclaw/.openclaw/tmp/autopilot-control-tower', 'Autopilot Control Tower workspace'], ['/home/node/.openclaw/tmp/autopilot-control-tower', 'Autopilot Control Tower repo']];
   const out = [];
-  for (const [repoPath, name] of candidates) if (await exists(repoPath)) out.push({ host: HOSTNAME, repoPath, name, key: projectKey(HOSTNAME, repoPath) });
+  for (const [repoPath, name] of candidates) if (await exists(repoPath)) out.push({ host: DEFAULT_PROJECT_HOST, repoPath, name, key: projectKey(DEFAULT_PROJECT_HOST, repoPath) });
   return out;
 }
 async function loadProjects() {
@@ -385,9 +421,9 @@ async function listRepoDir(host, repoPath, dir = '.') { const repo = validatePro
 async function readRepoFile(host, repoPath, file) { const repo = validateProject(host, repoPath); const full = path.resolve(repo, file || 'README.md'); if (!full.startsWith(repo)) throw Object.assign(new Error('path escapes repo'), { status: 400 }); const stat = await fs.stat(full); if (stat.isDirectory()) throw Object.assign(new Error('path is a directory'), { status: 400 }); if (stat.size > MAX_FILE_BYTES) throw Object.assign(new Error('file too large for preview'), { status: 413 }); return fs.readFile(full, 'utf8'); }
 async function readBody(req) { return new Promise((resolve, reject) => { let raw = ''; req.on('data', d => raw += d); req.on('end', () => { try { const parsed = raw ? JSON.parse(raw) : {}; log('debug', 'request.body.parsed', { requestId: req.requestId, bytes: raw.length, body: parsed }); resolve(parsed); } catch (e) { logError('request.body.parse_failed', e, { requestId: req.requestId, bytes: raw.length, preview: raw.slice(0, 500) }); reject(e); } }); req.on('error', reject); }); }
 async function handleApi(req, res, url) {
-  if (url.pathname === '/api/health') return json(res, 200, { ok: true, host: HOSTNAME, version: '0.4.0-real-openclaw-agents', agentRunsEnabled: AGENT_RUNS_ENABLED, agentRunsAuth: Boolean(AGENT_RUN_TOKEN) });
+  if (url.pathname === '/api/health') return json(res, 200, { ok: true, host: HOSTNAME, projectHost: DEFAULT_PROJECT_HOST, dataDir: DATA_DIR, version: '0.4.1-persistent-projects', agentRunsEnabled: AGENT_RUNS_ENABLED, agentRunsAuth: Boolean(AGENT_RUN_TOKEN) });
   if (url.pathname === '/api/projects' && req.method === 'GET') return json(res, 200, { projects: await loadProjects() });
-  if (url.pathname === '/api/projects' && req.method === 'POST') { const body = await readBody(req); const host = body.host || HOSTNAME; const repoPath = validateProject(host, body.repoPath); const projects = await loadProjects(); const item = { host, repoPath, name: body.name || path.basename(repoPath), key: projectKey(host, repoPath) }; await writeJson(PROJECTS_FILE, { projects: projects.filter(p => p.key !== item.key).concat(item) }); return json(res, 200, item); }
+  if (url.pathname === '/api/projects' && req.method === 'POST') { const body = await readBody(req); const host = body.host || DEFAULT_PROJECT_HOST; const repoPath = validateProject(host, body.repoPath); const projects = await loadProjects(); const item = { host, repoPath, name: body.name || path.basename(repoPath), key: projectKey(host, repoPath) }; await writeJson(PROJECTS_FILE, { projects: projects.filter(p => p.key !== item.key).concat(item) }); return json(res, 200, item); }
   if (url.pathname === '/api/project') return json(res, 200, await scanProject(url.searchParams.get('host'), url.searchParams.get('repoPath')));
   if (url.pathname === '/api/project/create' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await createProjectRepo(body.host, body.repoPath, body.name)); }
   if (url.pathname === '/api/config' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await configureLoop(body.host, body.repoPath, body)); }
@@ -419,5 +455,5 @@ const server = http.createServer(async (req, res) => {
 });
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Autopilot Control Tower listening on :${PORT}`);
-  log('info', 'server.started', { port: PORT, version: '0.4.0-real-openclaw-agents', agentRunsEnabled: AGENT_RUNS_ENABLED, agentRunsAuth: Boolean(AGENT_RUN_TOKEN), logLevel: LOG_LEVEL });
+  log('info', 'server.started', { port: PORT, version: '0.4.1-persistent-projects', dataDir: DATA_DIR, defaultProjectHost: DEFAULT_PROJECT_HOST, agentRunsEnabled: AGENT_RUNS_ENABLED, agentRunsAuth: Boolean(AGENT_RUN_TOKEN), logLevel: LOG_LEVEL });
 });
