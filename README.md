@@ -74,4 +74,15 @@ npm start
 - `POST /api/step` — advance one hierarchy-learning step
 - `GET /api/files` / `GET /api/file` — lightweight repo browser
 
-This is still a prototype. The current loop engine simulates supervisor/sub-agent runs deterministically; the next major step is wiring request, delegation, comparison, and prompt revision to real model calls.
+This is still a prototype. The simulated loop remains available, and the dashboard can now launch real OpenClaw agent runs when explicitly enabled.
+
+## Real OpenClaw agent bridge
+
+Set these on the server/container before allowing dashboard launches:
+
+- `OPENCLAW_AGENT_RUNS=1`
+- `OPENCLAW_AGENT_TOKEN=<private launch token>` — required; sent by the browser as `x-agent-token`
+- `OPENCLAW_HOME=/openclaw` — defaults this way in Docker so the OpenClaw CLI can use the mounted OpenClaw volume/config
+- optional: `OPENCLAW_BIN`, `OPENCLAW_AGENT_ID`, `OPENCLAW_AGENT_THINKING`, `OPENCLAW_AGENT_TIMEOUT`
+
+The public start endpoint is intentionally disabled unless both `OPENCLAW_AGENT_RUNS=1` and `OPENCLAW_AGENT_TOKEN` are set.

@@ -51,12 +51,14 @@ function renderDashboard() {
         <p class="muted">A three-level research loop: static overseer spawns supervisors, supervisors manage sub-agents, then weighted metrics pick the best hierarchy.</p>
       </div>
       <div class="toolbar">
-        <button data-step>Run next loop step</button>
+        <button data-start-agent>Start real OpenClaw agent</button>
+        <button data-step>Run simulated loop step</button>
       </div>
     </section>
     <div class="tabs">${['loop','variants','history','files'].map(t => `<button class="tab ${state.tab===t?'active':''}" data-tab="${t}">${t}</button>`).join('')}</div>
     <div id="tabBody">${renderTab()}</div>`;
   document.querySelector('[data-step]').onclick = runStep;
+  document.querySelector('[data-start-agent]').onclick = startAgent;
   document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => setTab(b.dataset.tab));
   const f = $('#intentForm'); if (f) f.onsubmit = saveConfig;
   if (state.tab === 'files') loadBrowser();
@@ -111,10 +113,12 @@ function renderLoop() {
         <label class="wide">Supervisor system prompt<textarea name="supervisorPrompt" rows="8">${esc(l.supervisorPrompt || '')}</textarea></label>
         <label>Model<input name="model" placeholder="gpt-5.5, opus, GLM..." value="${esc(l.model)}"></label>
         <label>A/B variants<input name="variantCount" type="number" min="1" max="6" value="${esc(l.variantCount || 3)}"></label>
-        <div class="toolbar align-end"><button>Save lab setup</button><button type="button" onclick="runStep()">Run next step</button></div>
+        <label>OpenClaw agent id<input name="agentId" placeholder="blank = default agent" value="${esc(l.agentId || '')}"></label>
+        <div class="toolbar align-end"><button>Save lab setup</button><button type="button" onclick="startAgent()">Start real agent</button><button type="button" onclick="runStep()">Run simulated step</button></div>
       </form>
     </section>
     <section class="card"><h2>Visible loop</h2><div class="loop">${s.stages.map(stageCard).join('')}</div></section>
+    <section class="card"><h2>Real OpenClaw agent runs</h2>${agentRuns(l.agentRuns)}</section>
     <section class="split">
       <div class="card"><h2>Acceptance criteria</h2>${criteriaList(l.oneShot?.acceptanceCriteria)}</div>
       <div class="card"><h2>Latest comparison</h2>${evaluation(l.evaluations.at(-1))}<h3>Learnings</h3>${learningList(l.learnings)}</div>
@@ -146,8 +150,24 @@ function renderHistory() {
 async function saveConfig(e) {
   e.preventDefault();
   const p = currentProject(), fd = new FormData(e.target);
-  state.snapshot.loop = await api('/api/config', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, intent: fd.get('intent'), model: fd.get('model'), overseerPrompt: fd.get('overseerPrompt'), supervisorPrompt: fd.get('supervisorPrompt'), variantCount: fd.get('variantCount') }) });
+  state.snapshot.loop = await api('/api/config', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, intent: fd.get('intent'), model: fd.get('model'), overseerPrompt: fd.get('overseerPrompt'), supervisorPrompt: fd.get('supervisorPrompt'), variantCount: fd.get('variantCount'), agentId: fd.get('agentId') }) });
   await refreshCurrent();
+}
+async function startAgent() {
+  const p = currentProject();
+  const f = $('#intentForm');
+  const fd = f ? new FormData(f) : new FormData();
+  try {
+    const token = localStorage.getItem('openclawAgentToken') || prompt('OpenClaw agent launch token');
+    if (!token) return;
+    localStorage.setItem('openclawAgentToken', token);
+    await api('/api/agent/start', { method:'POST', headers:{'content-type':'application/json', 'x-agent-token': token}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, message: fd.get('intent') || state.snapshot.loop.intent, agentId: fd.get('agentId') || '' }) });
+    await refreshCurrent();
+  } catch (e) { alert(e.message); }
+}
+function agentRuns(runs=[]) {
+  if (!runs.length) return '<p class="muted">No real OpenClaw agent runs yet. Use “Start real agent” to launch one from the current intent.</p>';
+  return `<div class="stack">${runs.map(r => `<div class="task"><strong>${esc(r.status)} · ${esc(r.id)}</strong><p>${esc(r.message || '')}</p><p class="muted mono">agent=${esc(r.agentId || 'default')} · session=${esc(r.sessionId || '')} · ${esc(r.ts || '')}${r.completedAt ? ` → ${esc(r.completedAt)}` : ''}</p>${r.output ? `<pre class="mini-pre">${esc(r.output)}</pre>` : '<p class="muted">Running… refresh for updates.</p>'}${r.error ? `<pre class="mini-pre bad">${esc(r.error)}</pre>` : ''}</div>`).join('')}</div>`;
 }
 async function runStep() {
   const p = currentProject();

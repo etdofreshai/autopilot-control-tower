@@ -3,3 +3,4 @@ node_modules/
 .DS_Store
 data/projects.local.json
 data/loop-state.json
+data/agent-runs/

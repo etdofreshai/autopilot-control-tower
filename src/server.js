@@ -11,10 +11,13 @@ const ROOT = path.resolve(__dirname, '..');
 const DATA_DIR = path.join(ROOT, 'data');
 const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
 const STATE_FILE = path.join(DATA_DIR, 'loop-state.json');
+const AGENT_RUNS_DIR = path.join(DATA_DIR, 'agent-runs');
 const PORT = Number(process.env.PORT || 8787);
 const HOSTNAME = os.hostname();
 const MAX_FILE_BYTES = 512 * 1024;
 const STAGES = ['request', 'overseer', 'supervisors', 'subagents', 'evaluate', 'improve'];
+const AGENT_RUNS_ENABLED = ['1', 'true', 'yes'].includes(String(process.env.OPENCLAW_AGENT_RUNS || '').toLowerCase());
+const AGENT_RUN_TOKEN = process.env.OPENCLAW_AGENT_TOKEN || '';
 
 const DEFAULT_OVERSEER_PROMPT = `You are Autopilot Overseer. Keep your role simple and stable: receive the user request, spawn a small set of supervisor variants, assign each supervisor the same intent, and compare their final results. Do not do the project work yourself.`;
 
@@ -51,6 +54,7 @@ function blankLoop() {
   return {
     intent: '',
     model: 'gpt-5.5',
+    agentId: '',
     overseerPrompt: DEFAULT_OVERSEER_PROMPT,
     supervisorPrompt: DEFAULT_SUPERVISOR_PROMPT,
     variantCount: 3,
@@ -68,6 +72,7 @@ function blankLoop() {
     learnings: [],
     promptRevisions: [],
     history: [],
+    agentRuns: [],
     updatedAt: now(),
   };
 }
@@ -126,6 +131,76 @@ function makeVariants(loop) {
     score: 0,
   }));
 }
+function runId() { return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`; }
+function shortText(s, max = 2400) { s = String(s || ''); return s.length > max ? s.slice(0, max) + `\n…truncated (${s.length} chars)` : s; }
+async function appendRunLog(id, chunk) { await fs.mkdir(AGENT_RUNS_DIR, { recursive: true }); await fs.appendFile(path.join(AGENT_RUNS_DIR, `${id}.log`), chunk); }
+async function updateAgentRun(projectKeyValue, id, patch) {
+  const all = await loadState();
+  const loop = normalizedLoop(all, projectKeyValue);
+  const runs = loop.agentRuns || [];
+  const idx = runs.findIndex(r => r.id === id);
+  if (idx >= 0) runs[idx] = { ...runs[idx], ...patch, updatedAt: now() };
+  else runs.unshift({ id, ...patch, updatedAt: now() });
+  loop.agentRuns = runs.slice(0, 30);
+  all.projects[projectKeyValue] = loop;
+  await writeJson(STATE_FILE, all);
+  return loop;
+}
+function requireAgentAuth(req) {
+  if (!AGENT_RUNS_ENABLED) throw Object.assign(new Error('Real OpenClaw agent runs are disabled on this server. Set OPENCLAW_AGENT_RUNS=1 and OPENCLAW_AGENT_TOKEN to enable them.'), { status: 503 });
+  if (!AGENT_RUN_TOKEN) throw Object.assign(new Error('OPENCLAW_AGENT_TOKEN is required before enabling public agent launches.'), { status: 503 });
+  const auth = req.headers.authorization || '';
+  const bearer = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7) : '';
+  const supplied = req.headers['x-agent-token'] || bearer;
+  if (supplied !== AGENT_RUN_TOKEN) throw Object.assign(new Error('agent launch token required'), { status: 401 });
+}
+async function startAgentRun(host, repoPath, body = {}) {
+  const repo = validateProject(host, repoPath);
+  if (!(await exists(repo))) throw Object.assign(new Error('repoPath does not exist'), { status: 400 });
+  const key = projectKey(host, repo);
+  const loop = normalizedLoop(await loadState(), key);
+  const id = runId();
+  const message = String(body.message || loop.intent || '').trim();
+  if (!message) throw Object.assign(new Error('Set an intent or provide a message before starting an agent.'), { status: 400 });
+  const agentId = String(body.agentId || loop.agentId || process.env.OPENCLAW_AGENT_ID || '').trim();
+  const thinking = String(body.thinking || process.env.OPENCLAW_AGENT_THINKING || 'medium');
+  const timeout = String(body.timeoutSeconds || process.env.OPENCLAW_AGENT_TIMEOUT || '900');
+  const sessionId = String(body.sessionId || `autopilot-${id}`);
+  const prompt = [
+    `You are a real OpenClaw agent run launched by Autopilot Control Tower.`,
+    `Project repo: ${repo}`,
+    `User request / intent:`,
+    message,
+    ``,
+    `Work directly in that repo when the request calls for code or file changes. Return a concise final report with files changed, validation performed, blockers, and next recommendation.`
+  ].join('\n');
+  const bin = process.env.OPENCLAW_BIN || 'openclaw';
+  const args = ['agent', '--session-id', sessionId, '--message', prompt, '--thinking', thinking, '--timeout', timeout, '--json'];
+  if (agentId) args.splice(1, 0, '--agent', agentId);
+  const entry = { id, ts: now(), status: 'running', repoPath: repo, agentId: agentId || 'default', sessionId, thinking, timeoutSeconds: Number(timeout), message: shortText(message, 1000), logFile: path.join(AGENT_RUNS_DIR, `${id}.log`) };
+  loop.agentRuns = [entry, ...(loop.agentRuns || [])].slice(0, 30);
+  loop.status = 'agent running'; loop.stage = 'subagents'; loop.updatedAt = now();
+  await saveProjectState(key, loop);
+  await appendRunLog(id, `$ ${bin} ${args.map(a => JSON.stringify(a)).join(' ')}\n\n`);
+  const child = spawn(bin, args, { cwd: repo, env: { ...process.env, HOME: process.env.OPENCLAW_HOME || process.env.HOME || '/openclaw' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '', err = '';
+  child.stdout.on('data', d => { out += d; appendRunLog(id, d).catch(()=>{}); });
+  child.stderr.on('data', d => { err += d; appendRunLog(id, d).catch(()=>{}); });
+  child.on('error', e => updateAgentRun(key, id, { status: 'failed', error: String(e), completedAt: now() }).catch(()=>{}));
+  child.on('close', rc => {
+    let parsed = null;
+    try { parsed = JSON.parse(out); } catch {}
+    const reply = parsed?.reply || parsed?.text || parsed?.message || parsed?.result || out;
+    updateAgentRun(key, id, { status: rc === 0 ? 'succeeded' : 'failed', rc, completedAt: now(), output: shortText(reply, 6000), error: shortText(err, 3000), rawJson: parsed ? parsed : undefined }).catch(()=>{});
+  });
+  return entry;
+}
+async function getAgentRunLog(id) {
+  const safe = String(id || '').replace(/[^a-z0-9-]/gi, '');
+  if (!safe) throw Object.assign(new Error('id required'), { status: 400 });
+  return fs.readFile(path.join(AGENT_RUNS_DIR, `${safe}.log`), 'utf8');
+}
+
 function weightedScore(metrics, weights) {
   return Math.round(
     metrics.correctness * weights.correctness +
@@ -185,7 +260,7 @@ function revisePrompt(loop, ev) {
 }
 async function configureLoop(host, repoPath, patch) {
   const repo = validateProject(host, repoPath); const key = projectKey(host, repo); const current = normalizedLoop(await loadState(), key);
-  const next = { ...current, intent: String(patch.intent ?? current.intent ?? ''), model: String(patch.model ?? current.model ?? 'gpt-5.5'), overseerPrompt: String(patch.overseerPrompt ?? current.overseerPrompt ?? DEFAULT_OVERSEER_PROMPT), supervisorPrompt: String(patch.supervisorPrompt ?? current.supervisorPrompt ?? DEFAULT_SUPERVISOR_PROMPT), variantCount: Number(patch.variantCount || current.variantCount || 3), status: 'ready', stage: 'request', updatedAt: now() };
+  const next = { ...current, intent: String(patch.intent ?? current.intent ?? ''), model: String(patch.model ?? current.model ?? 'gpt-5.5'), agentId: String(patch.agentId ?? current.agentId ?? ''), overseerPrompt: String(patch.overseerPrompt ?? current.overseerPrompt ?? DEFAULT_OVERSEER_PROMPT), supervisorPrompt: String(patch.supervisorPrompt ?? current.supervisorPrompt ?? DEFAULT_SUPERVISOR_PROMPT), variantCount: Number(patch.variantCount || current.variantCount || 3), status: 'ready', stage: 'request', updatedAt: now() };
   next.history = [...(current.history || []), { ts: now(), event: 'configured', intent: next.intent, model: next.model, variantCount: next.variantCount }].slice(-100);
   return saveProjectState(key, next);
 }
@@ -243,13 +318,15 @@ async function listRepoDir(host, repoPath, dir = '.') { const repo = validatePro
 async function readRepoFile(host, repoPath, file) { const repo = validateProject(host, repoPath); const full = path.resolve(repo, file || 'README.md'); if (!full.startsWith(repo)) throw Object.assign(new Error('path escapes repo'), { status: 400 }); const stat = await fs.stat(full); if (stat.isDirectory()) throw Object.assign(new Error('path is a directory'), { status: 400 }); if (stat.size > MAX_FILE_BYTES) throw Object.assign(new Error('file too large for preview'), { status: 413 }); return fs.readFile(full, 'utf8'); }
 async function readBody(req) { return new Promise((resolve, reject) => { let raw = ''; req.on('data', d => raw += d); req.on('end', () => { try { resolve(raw ? JSON.parse(raw) : {}); } catch (e) { reject(e); } }); req.on('error', reject); }); }
 async function handleApi(req, res, url) {
-  if (url.pathname === '/api/health') return json(res, 200, { ok: true, host: HOSTNAME, version: '0.3.1-create-missing-repos' });
+  if (url.pathname === '/api/health') return json(res, 200, { ok: true, host: HOSTNAME, version: '0.4.0-real-openclaw-agents', agentRunsEnabled: AGENT_RUNS_ENABLED, agentRunsAuth: Boolean(AGENT_RUN_TOKEN) });
   if (url.pathname === '/api/projects' && req.method === 'GET') return json(res, 200, { projects: await loadProjects() });
   if (url.pathname === '/api/projects' && req.method === 'POST') { const body = await readBody(req); const host = body.host || HOSTNAME; const repoPath = validateProject(host, body.repoPath); const projects = await loadProjects(); const item = { host, repoPath, name: body.name || path.basename(repoPath), key: projectKey(host, repoPath) }; await writeJson(PROJECTS_FILE, { projects: projects.filter(p => p.key !== item.key).concat(item) }); return json(res, 200, item); }
   if (url.pathname === '/api/project') return json(res, 200, await scanProject(url.searchParams.get('host'), url.searchParams.get('repoPath')));
   if (url.pathname === '/api/project/create' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await createProjectRepo(body.host, body.repoPath, body.name)); }
   if (url.pathname === '/api/config' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await configureLoop(body.host, body.repoPath, body)); }
   if (url.pathname === '/api/step' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await stepLoop(body.host, body.repoPath)); }
+  if (url.pathname === '/api/agent/start' && req.method === 'POST') { requireAgentAuth(req); const body = await readBody(req); return json(res, 200, await startAgentRun(body.host, body.repoPath, body)); }
+  if (url.pathname === '/api/agent/log') return text(res, 200, await getAgentRunLog(url.searchParams.get('id')));
   if (url.pathname === '/api/files') return json(res, 200, { entries: await listRepoDir(url.searchParams.get('host'), url.searchParams.get('repoPath'), url.searchParams.get('dir') || '.') });
   if (url.pathname === '/api/file') return text(res, 200, await readRepoFile(url.searchParams.get('host'), url.searchParams.get('repoPath'), url.searchParams.get('file')));
   return json(res, 404, { error: 'not found' });
