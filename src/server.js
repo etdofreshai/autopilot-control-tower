@@ -10,6 +10,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const DATA_DIR = path.join(ROOT, 'data');
 const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
+const SETTINGS_FILE = path.join(DATA_DIR, 'project-settings.json');
 const PORT = Number(process.env.PORT || 8787);
 const HOSTNAME = os.hostname();
 const MAX_FILE_BYTES = 512 * 1024;
@@ -102,6 +103,71 @@ async function listFilesSafe(dir, re = /.*/) {
   try { return (await fs.readdir(dir)).filter(n => re.test(n)).sort(); } catch { return []; }
 }
 function latestByName(names) { return names.sort().at(-1) || null; }
+function tailText(raw, maxLines = 120, maxChars = 20000) {
+  const tail = String(raw || '').slice(-maxChars);
+  return tail.split('\n').slice(-maxLines).join('\n');
+}
+
+async function loadSettings() {
+  const data = await readJson(SETTINGS_FILE, { projects: {} });
+  return data && typeof data === 'object' ? data : { projects: {} };
+}
+async function settingsFor(host, repoPath) {
+  const repo = validateProject(host, repoPath);
+  const all = await loadSettings();
+  const key = projectKey(host, repo);
+  return all.projects?.[key] || {
+    notificationPolicy: 'failures',
+    notifyEveryWaves: 5,
+    telegramTarget: '',
+    startMode: 'request-file',
+    startCommand: '',
+  };
+}
+async function saveSettings(host, repoPath, patch) {
+  const repo = validateProject(host, repoPath);
+  const all = await loadSettings();
+  all.projects ||= {};
+  const key = projectKey(host, repo);
+  all.projects[key] = { ...(await settingsFor(host, repo)), ...patch };
+  await writeJson(SETTINGS_FILE, all);
+  return all.projects[key];
+}
+async function appendProjectEvent(repo, event) {
+  const state = path.join(repo, 'state');
+  await fs.mkdir(state, { recursive: true });
+  const line = JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n';
+  await fs.appendFile(path.join(state, 'autopilot-control-events.jsonl'), line, 'utf8');
+}
+async function startProject(host, repoPath, body = {}) {
+  const repo = validateProject(host, repoPath);
+  const settings = await settingsFor(host, repo);
+  const request = {
+    action: 'start-requested',
+    request: body.request || 'Continue current autopilot job',
+    notificationPolicy: settings.notificationPolicy,
+    notifyEveryWaves: settings.notifyEveryWaves,
+    telegramTarget: settings.telegramTarget,
+    startMode: settings.startMode,
+    status: 'queued-for-openclaw',
+  };
+  await appendProjectEvent(repo, request);
+  // Short-term bridge: write a durable request into the mounted repo so OpenClaw
+  // can pick it up or a future runner can execute it. We intentionally do not
+  // shell out from the public dashboard container yet.
+  await fs.writeFile(path.join(repo, 'state', 'AUTOPILOT_START_REQUEST.json'), JSON.stringify(request, null, 2) + '\n', 'utf8');
+  return { ok: true, mode: 'request-file', message: 'Start request recorded in repo state. OpenClaw runner hookup is the next bridge step.', request };
+}
+async function liveProject(host, repoPath) {
+  const repo = validateProject(host, repoPath);
+  const logs = path.join(repo, 'logs');
+  const names = await listFilesSafe(logs);
+  const preferred = latestByName(names.filter(n => n.includes('parallel-autopilot') || n.includes('autopilot-supervisor'))) || latestByName(names.filter(n => n.includes('wave'))) || latestByName(names);
+  const eventsPath = path.join(repo, 'state', 'autopilot-control-events.jsonl');
+  const logText = preferred ? await fs.readFile(path.join(logs, preferred), 'utf8').catch(e => String(e)) : 'No live log file found yet.';
+  const eventText = await fs.readFile(eventsPath, 'utf8').catch(() => '');
+  return { logFile: preferred ? `logs/${preferred}` : null, logTail: tailText(logText, 160), eventsTail: tailText(eventText, 60) };
+}
 
 async function parseWaveSummaries(repo) {
   const logs = path.join(repo, 'logs');
@@ -263,6 +329,7 @@ async function scanProject(host, repoPath) {
     },
     docs: await projectDocs(repo),
     learnings: await projectLearnings(repo, waves),
+    settings: await settingsFor(host, repo),
   };
 }
 
@@ -335,6 +402,9 @@ async function handleApi(req, res, url) {
   if (url.pathname === '/api/project') return json(res, 200, await scanProject(url.searchParams.get('host'), url.searchParams.get('repoPath')));
   if (url.pathname === '/api/files') return json(res, 200, { entries: await listRepoDir(url.searchParams.get('host'), url.searchParams.get('repoPath'), url.searchParams.get('dir') || '.') });
   if (url.pathname === '/api/file') return text(res, 200, await readRepoFile(url.searchParams.get('host'), url.searchParams.get('repoPath'), url.searchParams.get('file')), 'text/plain; charset=utf-8');
+  if (url.pathname === '/api/live') return json(res, 200, await liveProject(url.searchParams.get('host'), url.searchParams.get('repoPath')));
+  if (url.pathname === '/api/settings' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await saveSettings(body.host, body.repoPath, body.settings || {})); }
+  if (url.pathname === '/api/start' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await startProject(body.host, body.repoPath, body)); }
   if (url.pathname === '/api/control' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await controlProject(body.host, body.repoPath, body.action)); }
   return json(res, 404, { error: 'not found' });
 }

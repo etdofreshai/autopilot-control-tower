@@ -1,5 +1,5 @@
 const $ = sel => document.querySelector(sel);
-const state = { projects: [], current: null, snapshot: null, dir: '.', file: 'README.md', tab: 'overview' };
+const state = { projects: [], current: null, snapshot: null, dir: '.', file: 'README.md', tab: 'overview', live: null, rendering: false };
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
@@ -35,9 +35,12 @@ async function addProject(e) {
 async function selectProject(key) { state.current = key; state.dir='.'; state.file='README.md'; await loadProjects(); await refreshCurrent(); }
 function currentProject() { return state.projects.find(p => p.key === state.current); }
 async function refreshCurrent() {
-  const p = currentProject(); if (!p) return;
-  try { state.snapshot = await api(`/api/project?${qs({host:p.host, repoPath:p.repoPath})}`); renderDashboard(); }
-  catch (e) { $('#dashboard').innerHTML = `<div class="card"><h2>Error</h2><p>${esc(e.message)}</p></div>`; }
+  const p = currentProject(); if (!p || state.rendering) return;
+  const y = window.scrollY;
+  try {
+    state.snapshot = await api(`/api/project?${qs({host:p.host, repoPath:p.repoPath})}`);
+    renderDashboard({ preserveScroll: y });
+  } catch (e) { $('#dashboard').innerHTML = `<div class="card"><h2>Error</h2><p>${esc(e.message)}</p></div>`; }
 }
 async function control(action) {
   const p = currentProject();
@@ -46,35 +49,88 @@ async function control(action) {
 }
 function setTab(tab) { state.tab = tab; renderDashboard(); }
 
-function renderDashboard() {
+function renderDashboard(opts = {}) {
+  state.rendering = true;
   const s = state.snapshot, p = currentProject();
   $('#dashboard').innerHTML = `
     <section class="card">
       <div class="toolbar" style="justify-content:space-between;align-items:start">
         <div><h2 style="margin:0">${esc(p.name)}</h2><p class="muted mono">${esc(s.key)}</p></div>
         <div class="toolbar">
+          <button data-start>Start / continue</button>
           <button class="warn" data-control="stop-after-current-wave">Stop after wave</button>
           <button class="danger" data-control="stop-now">Stop now</button>
           <button data-control="resume">Resume / clear stops</button>
         </div>
       </div>
       <div class="tabs">
-        ${['overview','waves','prompts','learnings','files'].map(t => `<button class="tab ${state.tab===t?'active':''}" data-tab="${t}">${t}</button>`).join('')}
+        ${['overview','waves','live','prompts','learnings','settings','files'].map(t => `<button class="tab ${state.tab===t?'active':''}" data-tab="${t}">${t}</button>`).join('')}
       </div>
     </section>
     <div id="tabBody">${renderTab()}</div>
   `;
   document.querySelectorAll('[data-control]').forEach(b => b.onclick = () => control(b.dataset.control));
+  document.querySelectorAll('[data-start]').forEach(b => b.onclick = () => startJob());
   document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => setTab(b.dataset.tab));
   if (state.tab === 'files') loadBrowser();
+  if (state.tab === 'live') loadLive();
+  const sf = document.querySelector('#settingsForm'); if (sf) sf.onsubmit = saveSettings;
+  if (opts.preserveScroll != null) requestAnimationFrame(() => window.scrollTo({ top: opts.preserveScroll }));
+  state.rendering = false;
 }
 function renderTab() {
   if (state.tab === 'waves') return renderWaves();
+  if (state.tab === 'live') return renderLive();
   if (state.tab === 'prompts') return renderPrompts();
   if (state.tab === 'learnings') return renderLearnings();
+  if (state.tab === 'settings') return renderSettings();
   if (state.tab === 'files') return `<section class="card"><h2>Repo browser</h2><div id="browser" class="filegrid"><div class="filelist muted">loading…</div><pre class="preview"></pre></div></section>`;
   return renderOverview();
 }
+async function startJob() {
+  const p = currentProject();
+  const request = prompt('Start/continue request:', state.snapshot?.request?.text || 'Continue current autopilot job');
+  if (request == null) return;
+  const result = await api('/api/start', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, request }) });
+  alert(result.message || 'Start requested');
+  state.tab = 'live';
+  await refreshCurrent();
+}
+function renderLive() {
+  return `<section class="card"><h2>Live view</h2><p class="muted">Short rolling view of the active autopilot log plus Control Tower events. This is meant to prove the job is doing things without spamming Telegram.</p><div class="toolbar"><button onclick="loadLive()">Refresh live log</button><button onclick="startJob()">Start / continue</button></div><div class="split"><div><h3>Log tail <span id="liveFile" class="muted mono"></span></h3><pre id="liveLog" class="preview">loading…</pre></div><div><h3>Control events</h3><pre id="liveEvents" class="preview">loading…</pre></div></div></section>`;
+}
+async function loadLive() {
+  const p = currentProject();
+  try {
+    state.live = await api(`/api/live?${qs({host:p.host, repoPath:p.repoPath})}`);
+    const log = $('#liveLog'), events = $('#liveEvents'), file = $('#liveFile');
+    if (file) file.textContent = state.live.logFile || '';
+    if (log) log.textContent = state.live.logTail || 'No live log yet.';
+    if (events) events.textContent = state.live.eventsTail || 'No control events yet.';
+  } catch (e) {
+    const log = $('#liveLog'); if (log) log.textContent = e.message;
+  }
+}
+function renderSettings() {
+  const s = state.snapshot.settings || {};
+  return `<section class="card"><h2>Notification & start settings</h2><p class="muted">This is the policy the Start button records with each run. Next bridge pass will have OpenClaw consume it and send start/progress updates to the right Telegram group.</p><form id="settingsForm" class="settings-grid">
+    <label>Notification policy<select name="notificationPolicy"><option ${s.notificationPolicy==='off'?'selected':''}>off</option><option ${s.notificationPolicy==='start-stop'?'selected':''}>start-stop</option><option ${s.notificationPolicy==='every-wave'?'selected':''}>every-wave</option><option ${s.notificationPolicy==='failures'?'selected':''}>failures</option><option ${s.notificationPolicy==='every-n-waves'?'selected':''}>every-n-waves</option></select></label>
+    <label>Notify every N waves<input name="notifyEveryWaves" type="number" min="1" value="${esc(s.notifyEveryWaves || 5)}"></label>
+    <label>Telegram target / group<input name="telegramTarget" placeholder="telegram:-123" value="${esc(s.telegramTarget || '')}"></label>
+    <label>Start mode<select name="startMode"><option ${s.startMode==='request-file'?'selected':''}>request-file</option><option ${s.startMode==='openclaw-bridge'?'selected':''}>openclaw-bridge</option></select></label>
+    <label class="wide">Future start command<textarea name="startCommand" rows="3" placeholder="scripts/project_parallel_autopilot.py ...">${esc(s.startCommand || '')}</textarea></label>
+    <div class="wide toolbar"><button>Save settings</button><button type="button" onclick="startJob()">Start / continue with these settings</button></div>
+  </form></section>`;
+}
+async function saveSettings(e) {
+  e.preventDefault();
+  const p = currentProject(), fd = new FormData(e.target);
+  const settings = Object.fromEntries(fd.entries());
+  settings.notifyEveryWaves = Number(settings.notifyEveryWaves || 5);
+  await api('/api/settings', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, settings }) });
+  await refreshCurrent();
+}
+
 function renderOverview() {
   const s = state.snapshot;
   return `
