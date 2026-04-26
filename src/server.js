@@ -170,7 +170,8 @@ function parseOpenClawJson(out) {
   return fallback;
 }
 function openClawReply(parsed, out) {
-  return parsed?.reply || parsed?.text || parsed?.message || parsed?.result || parsed?.finalAssistantVisibleText || parsed?.finalAssistantRawText || parsed?.data?.finalAssistantVisibleText || parsed?.turn?.finalAssistantVisibleText || out;
+  const payloadText = Array.isArray(parsed?.payloads) ? parsed.payloads.map(p => p?.text).filter(Boolean).join('\n\n') : '';
+  return payloadText || parsed?.reply || parsed?.text || parsed?.message || parsed?.result || parsed?.finalAssistantVisibleText || parsed?.finalAssistantRawText || parsed?.data?.finalAssistantVisibleText || parsed?.turn?.finalAssistantVisibleText || out;
 }
 async function appendRunLog(id, chunk) { await fs.mkdir(AGENT_RUNS_DIR, { recursive: true }); await fs.appendFile(path.join(AGENT_RUNS_DIR, `${id}.log`), chunk); }
 async function updateAgentRun(projectKeyValue, id, patch) {
@@ -233,7 +234,19 @@ async function startAgentRun(host, repoPath, body = {}) {
     const combined = `${out}\n${err}`;
     const parsed = parseOpenClawJson(combined);
     const reply = openClawReply(parsed, combined);
-    updateAgentRun(key, id, { status: rc === 0 ? 'succeeded' : 'failed', rc, completedAt: now(), output: shortText(reply, 6000), error: shortText(err, 3000), rawJson: parsed ? parsed : undefined }).catch(()=>{});
+    (async () => {
+      const all = await loadState();
+      const latest = normalizedLoop(all, key);
+      const runs = latest.agentRuns || [];
+      const remaining = runs.some(r => r.id !== id && r.status === 'running');
+      const succeeded = rc === 0;
+      latest.status = remaining ? 'agent running' : (succeeded ? 'agent completed' : 'agent failed');
+      latest.stage = remaining ? latest.stage : (succeeded ? 'evaluate' : 'subagents');
+      latest.history = [...(latest.history || []), { ts: now(), event: succeeded ? 'agent_completed' : 'agent_failed', id, rc, sessionId }].slice(-80);
+      all.projects[key] = latest;
+      await writeJson(STATE_FILE, all);
+      await updateAgentRun(key, id, { status: succeeded ? 'succeeded' : 'failed', rc, completedAt: now(), output: shortText(reply, 6000), error: succeeded ? '' : shortText(err, 3000), warnings: succeeded ? shortText(err, 3000) : '', rawJson: parsed ? parsed : undefined });
+    })().catch(e => logError('agent.close.update_failed', e, { id, repo, sessionId }));
   });
   return entry;
 }
