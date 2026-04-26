@@ -221,6 +221,10 @@ async function handleApi(req, res, url) {
 function readBody(req) { return new Promise((resolve, reject) => { let raw = ''; req.on('data', d => raw += d); req.on('end', () => { try { resolve(raw ? JSON.parse(raw) : {}); } catch (e) { reject(e); } }); req.on('error', reject); }); }
 
 async function serveStatic(req, res, url) {
+  if (url.pathname === '/favicon.ico') {
+    res.writeHead(204, { 'cache-control': 'public, max-age=86400' });
+    return res.end();
+  }
   let file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
   const full = path.resolve(ROOT, 'public', file);
   if (!full.startsWith(path.resolve(ROOT, 'public'))) return text(res, 403, 'forbidden');

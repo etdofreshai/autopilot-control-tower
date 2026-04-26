@@ -16,7 +16,8 @@ async function init() {
   await loadProjects();
   $('#refresh').onclick = () => refreshCurrent();
   $('#addProject').onsubmit = addProject;
-  if (state.projects[0]) selectProject(state.projects[0].key);
+  const preferred = state.projects.find(p => p.host === 'dokploy' && p.repoPath === '/app') || state.projects[0];
+  if (preferred) selectProject(preferred.key);
   setInterval(refreshCurrent, 15000);
 }
 async function loadProjects() {
