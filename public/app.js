@@ -42,6 +42,7 @@ function setTab(tab) { state.tab = tab; renderDashboard(); }
 function renderDashboard() {
   state.rendering = true;
   const p = currentProject();
+  if (state.snapshot?.missing) return renderMissingProject(p, state.snapshot);
   $('#dashboard').innerHTML = `
     <section class="card hero">
       <div>
@@ -60,6 +61,32 @@ function renderDashboard() {
   const f = $('#intentForm'); if (f) f.onsubmit = saveConfig;
   if (state.tab === 'files') loadBrowser();
   state.rendering = false;
+}
+function renderMissingProject(p, s) {
+  state.rendering = true;
+  $('#dashboard').innerHTML = `
+    <section class="card hero">
+      <div>
+        <p class="eyebrow">${esc(s.repoPath)}</p>
+        <h2>${esc(p.name || 'Missing project')}</h2>
+        <p class="muted">This project is tracked, but the repo folder does not exist yet.</p>
+      </div>
+    </section>
+    <section class="card">
+      <h2>Create this repo?</h2>
+      <p>The Control Tower can create the folder, initialize git, and add a starter README so this project becomes usable.</p>
+      <p class="muted mono">${esc(s.repoPath)}</p>
+      ${s.canCreate ? '<div class="toolbar"><button data-create-repo>Create repo here</button></div>' : '<p class="pill bad">This path is outside the safe create locations.</p>'}
+    </section>`;
+  const b = document.querySelector('[data-create-repo]');
+  if (b) b.onclick = createRepo;
+  state.rendering = false;
+}
+async function createRepo() {
+  const p = currentProject();
+  if (!confirm(`Create a new git repo at ${p.repoPath}?`)) return;
+  await api('/api/project/create', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, name:p.name }) });
+  await refreshCurrent();
 }
 function renderTab() {
   if (state.tab === 'history') return renderHistory();

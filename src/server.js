@@ -214,15 +214,40 @@ async function stepLoop(host, repoPath) {
   }
   loop.history = history.slice(-100); loop.updatedAt = now(); return saveProjectState(key, loop);
 }
-async function scanProject(host, repoPath) { const repo = validateProject(host, repoPath); if (!(await exists(repo))) throw Object.assign(new Error('repoPath does not exist'), { status: 404 }); const key = projectKey(host, repo); const state = normalizedLoop(await loadState(), key); return { key, host, repoPath: repo, git: await gitStatus(repo), loop: state, stages: loopCards(state) }; }
+async function scanProject(host, repoPath) {
+  const repo = validateProject(host, repoPath);
+  const key = projectKey(host, repo);
+  if (!(await exists(repo))) return { key, host, repoPath: repo, missing: true, canCreate: canCreateRepo(repo), message: 'This project path does not exist yet.' };
+  const state = normalizedLoop(await loadState(), key);
+  return { key, host, repoPath: repo, missing: false, git: await gitStatus(repo), loop: state, stages: loopCards(state) };
+}
+function canCreateRepo(repo) {
+  const allowed = ['/openclaw/.openclaw/tmp', '/home/node/.openclaw/tmp', '/tmp'];
+  return allowed.some(base => repo === base || repo.startsWith(base + path.sep));
+}
+async function createProjectRepo(host, repoPath, name = '') {
+  const repo = validateProject(host, repoPath);
+  if (!canCreateRepo(repo)) throw Object.assign(new Error('For safety, new repos can only be created under /openclaw/.openclaw/tmp, /home/node/.openclaw/tmp, or /tmp.'), { status: 400 });
+  if (await exists(repo)) return await scanProject(host, repo);
+  await fs.mkdir(repo, { recursive: true });
+  const title = name || path.basename(repo);
+  await fs.writeFile(path.join(repo, 'README.md'), `# ${title}\n\nCreated by Autopilot Control Tower.\n`, 'utf8');
+  await fs.mkdir(path.join(repo, 'src'), { recursive: true });
+  await fs.writeFile(path.join(repo, '.gitignore'), 'node_modules/\n.env\n.DS_Store\n', 'utf8');
+  await runGit(repo, ['init'], 10000);
+  await runGit(repo, ['add', 'README.md', '.gitignore'], 10000);
+  await runGit(repo, ['commit', '-m', 'Initial project scaffold'], 10000);
+  return await scanProject(host, repo);
+}
 async function listRepoDir(host, repoPath, dir = '.') { const repo = validateProject(host, repoPath); const full = path.resolve(repo, dir); if (!full.startsWith(repo)) throw Object.assign(new Error('path escapes repo'), { status: 400 }); const entries = await fs.readdir(full, { withFileTypes: true }); return entries.filter(e => !['.git', 'node_modules'].includes(e.name)).map(e => ({ name: e.name, path: path.relative(repo, path.join(full, e.name)) || '.', type: e.isDirectory() ? 'dir' : 'file' })).sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1)); }
 async function readRepoFile(host, repoPath, file) { const repo = validateProject(host, repoPath); const full = path.resolve(repo, file || 'README.md'); if (!full.startsWith(repo)) throw Object.assign(new Error('path escapes repo'), { status: 400 }); const stat = await fs.stat(full); if (stat.isDirectory()) throw Object.assign(new Error('path is a directory'), { status: 400 }); if (stat.size > MAX_FILE_BYTES) throw Object.assign(new Error('file too large for preview'), { status: 413 }); return fs.readFile(full, 'utf8'); }
 async function readBody(req) { return new Promise((resolve, reject) => { let raw = ''; req.on('data', d => raw += d); req.on('end', () => { try { resolve(raw ? JSON.parse(raw) : {}); } catch (e) { reject(e); } }); req.on('error', reject); }); }
 async function handleApi(req, res, url) {
-  if (url.pathname === '/api/health') return json(res, 200, { ok: true, host: HOSTNAME, version: '0.3.0-supervisor-lab' });
+  if (url.pathname === '/api/health') return json(res, 200, { ok: true, host: HOSTNAME, version: '0.3.1-create-missing-repos' });
   if (url.pathname === '/api/projects' && req.method === 'GET') return json(res, 200, { projects: await loadProjects() });
   if (url.pathname === '/api/projects' && req.method === 'POST') { const body = await readBody(req); const host = body.host || HOSTNAME; const repoPath = validateProject(host, body.repoPath); const projects = await loadProjects(); const item = { host, repoPath, name: body.name || path.basename(repoPath), key: projectKey(host, repoPath) }; await writeJson(PROJECTS_FILE, { projects: projects.filter(p => p.key !== item.key).concat(item) }); return json(res, 200, item); }
   if (url.pathname === '/api/project') return json(res, 200, await scanProject(url.searchParams.get('host'), url.searchParams.get('repoPath')));
+  if (url.pathname === '/api/project/create' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await createProjectRepo(body.host, body.repoPath, body.name)); }
   if (url.pathname === '/api/config' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await configureLoop(body.host, body.repoPath, body)); }
   if (url.pathname === '/api/step' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await stepLoop(body.host, body.repoPath)); }
   if (url.pathname === '/api/files') return json(res, 200, { entries: await listRepoDir(url.searchParams.get('host'), url.searchParams.get('repoPath'), url.searchParams.get('dir') || '.') });
