@@ -149,14 +149,38 @@ async function startProject(host, repoPath, body = {}) {
     notifyEveryWaves: settings.notifyEveryWaves,
     telegramTarget: settings.telegramTarget,
     startMode: settings.startMode,
-    status: 'queued-for-openclaw',
+    status: settings.startMode === 'direct-command' ? 'starting' : 'queued-for-openclaw',
   };
   await appendProjectEvent(repo, request);
-  // Short-term bridge: write a durable request into the mounted repo so OpenClaw
-  // can pick it up or a future runner can execute it. We intentionally do not
-  // shell out from the public dashboard container yet.
   await fs.writeFile(path.join(repo, 'state', 'AUTOPILOT_START_REQUEST.json'), JSON.stringify(request, null, 2) + '\n', 'utf8');
-  return { ok: true, mode: 'request-file', message: 'Start request recorded in repo state. OpenClaw runner hookup is the next bridge step.', request };
+
+  if (settings.startMode === 'direct-command') {
+    if (!settings.startCommand?.trim()) throw Object.assign(new Error('startCommand is required for direct-command mode'), { status: 400 });
+    await fs.mkdir(path.join(repo, 'logs'), { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const logPath = path.join(repo, 'logs', `controltower-start-${stamp}.log`);
+    const out = fssync.openSync(logPath, 'a');
+    const child = spawn(settings.startCommand, {
+      cwd: repo,
+      shell: true,
+      detached: true,
+      stdio: ['ignore', out, out],
+      env: {
+        ...process.env,
+        HOME: process.env.OPENCLAW_HOME || '/openclaw',
+        PATH: `${process.env.OPENCLAW_HOME || '/openclaw'}/.local/bin:${process.env.PATH || ''}`,
+        AUTOPILOT_REQUEST: request.request,
+        AUTOPILOT_TELEGRAM_TARGET: settings.telegramTarget || '',
+      },
+    });
+    child.unref();
+    const started = { action: 'process-started', pid: child.pid, command: settings.startCommand, log: path.relative(repo, logPath), status: 'running' };
+    await appendProjectEvent(repo, started);
+    await fs.writeFile(path.join(repo, 'state', 'AUTOPILOT_CONTROLTOWER_PID'), String(child.pid) + '\n', 'utf8');
+    return { ok: true, mode: 'direct-command', message: `Started autopilot command as pid ${child.pid}.`, request, process: started };
+  }
+
+  return { ok: true, mode: 'request-file', message: 'Start request recorded in repo state. Switch Settings → Start mode to direct-command to launch from the page.', request };
 }
 async function liveProject(host, repoPath) {
   const repo = validateProject(host, repoPath);

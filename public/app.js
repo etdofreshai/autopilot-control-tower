@@ -113,11 +113,11 @@ async function loadLive() {
 }
 function renderSettings() {
   const s = state.snapshot.settings || {};
-  return `<section class="card"><h2>Notification & start settings</h2><p class="muted">This is the policy the Start button records with each run. Next bridge pass will have OpenClaw consume it and send start/progress updates to the right Telegram group.</p><form id="settingsForm" class="settings-grid">
+  return `<section class="card"><h2>Notification & start settings</h2><p class="muted">This is the policy the Start button records with each run. direct-command starts the configured repo command inside the mounted OpenClaw volume; request-file only records an audit/request file.</p><form id="settingsForm" class="settings-grid">
     <label>Notification policy<select name="notificationPolicy"><option ${s.notificationPolicy==='off'?'selected':''}>off</option><option ${s.notificationPolicy==='start-stop'?'selected':''}>start-stop</option><option ${s.notificationPolicy==='every-wave'?'selected':''}>every-wave</option><option ${s.notificationPolicy==='failures'?'selected':''}>failures</option><option ${s.notificationPolicy==='every-n-waves'?'selected':''}>every-n-waves</option></select></label>
     <label>Notify every N waves<input name="notifyEveryWaves" type="number" min="1" value="${esc(s.notifyEveryWaves || 5)}"></label>
     <label>Telegram target / group<input name="telegramTarget" placeholder="telegram:-123" value="${esc(s.telegramTarget || '')}"></label>
-    <label>Start mode<select name="startMode"><option ${s.startMode==='request-file'?'selected':''}>request-file</option><option ${s.startMode==='openclaw-bridge'?'selected':''}>openclaw-bridge</option></select></label>
+    <label>Start mode<select name="startMode"><option ${s.startMode==='request-file'?'selected':''}>request-file</option><option ${s.startMode==='openclaw-bridge'?'selected':''}>openclaw-bridge</option><option ${s.startMode==='direct-command'?'selected':''}>direct-command</option></select></label>
     <label class="wide">Future start command<textarea name="startCommand" rows="3" placeholder="scripts/project_parallel_autopilot.py ...">${esc(s.startCommand || '')}</textarea></label>
     <div class="wide toolbar"><button>Save settings</button><button type="button" onclick="startJob()">Start / continue with these settings</button></div>
   </form></section>`;
