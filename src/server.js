@@ -135,14 +135,19 @@ function runId() { return `${Date.now().toString(36)}-${Math.random().toString(3
 function shortText(s, max = 2400) { s = String(s || ''); return s.length > max ? s.slice(0, max) + `\n…truncated (${s.length} chars)` : s; }
 function parseOpenClawJson(out) {
   try { return JSON.parse(out); } catch {}
-  for (let i = out.lastIndexOf('{'); i >= 0; i = out.lastIndexOf('{', i - 1)) {
+  let fallback = null;
+  for (let i = out.indexOf('{'); i >= 0; i = out.indexOf('{', i + 1)) {
     const candidate = out.slice(i).trim();
-    try { return JSON.parse(candidate); } catch {}
+    try {
+      const parsed = JSON.parse(candidate);
+      if (openClawReply(parsed, '') !== '') return parsed;
+      fallback ||= parsed;
+    } catch {}
   }
-  return null;
+  return fallback;
 }
 function openClawReply(parsed, out) {
-  return parsed?.reply || parsed?.text || parsed?.message || parsed?.result || parsed?.finalAssistantVisibleText || parsed?.data?.finalAssistantVisibleText || parsed?.turn?.finalAssistantVisibleText || out;
+  return parsed?.reply || parsed?.text || parsed?.message || parsed?.result || parsed?.finalAssistantVisibleText || parsed?.finalAssistantRawText || parsed?.data?.finalAssistantVisibleText || parsed?.turn?.finalAssistantVisibleText || out;
 }
 async function appendRunLog(id, chunk) { await fs.mkdir(AGENT_RUNS_DIR, { recursive: true }); await fs.appendFile(path.join(AGENT_RUNS_DIR, `${id}.log`), chunk); }
 async function updateAgentRun(projectKeyValue, id, patch) {
