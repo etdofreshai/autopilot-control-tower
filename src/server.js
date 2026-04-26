@@ -32,8 +32,8 @@ async function writeJson(p, value) { await fs.mkdir(path.dirname(p), { recursive
 
 function validateProject(host, repoPath) {
   if (!host || !repoPath) throw Object.assign(new Error('host and repoPath are required'), { status: 400 });
-  const localHosts = new Set(['local', 'localhost', HOSTNAME]);
-  if (!localHosts.has(host)) throw Object.assign(new Error(`remote host ${host} is not supported by this MVP yet`), { status: 400 });
+  // In this MVP, host is a project-identity label. The deployed container operates
+  // on mounted local paths; future versions can route by host to remote agents.
   if (!path.isAbsolute(repoPath)) throw Object.assign(new Error('repoPath must be absolute'), { status: 400 });
   if (repoPath.includes('\0')) throw Object.assign(new Error('invalid repoPath'), { status: 400 });
   return path.resolve(repoPath);
