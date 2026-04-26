@@ -1,6 +1,12 @@
 {
   "projects": [
     {
+      "host": "dokploy",
+      "repoPath": "/app",
+      "name": "Autopilot Control Tower container",
+      "key": "dokploy:/app"
+    },
+    {
       "host": "233b25d7bf4b",
       "repoPath": "/home/node/.openclaw/tmp/Wolfenstein 3D port",
       "name": "Wolfenstein 3D port",
@@ -15,7 +21,7 @@
     {
       "host": "233b25d7bf4b",
       "repoPath": "/home/node/.openclaw/tmp/autopilot-control-tower",
-      "name": "Autopilot Control Tower",
+      "name": "Autopilot Control Tower workspace",
       "key": "233b25d7bf4b:/home/node/.openclaw/tmp/autopilot-control-tower"
     }
   ]

@@ -41,9 +41,10 @@ function validateProject(host, repoPath) {
 
 async function defaultProjects() {
   const candidates = [
+    ['/app', 'Autopilot Control Tower container'],
     ['/home/node/.openclaw/tmp/Wolfenstein 3D port', 'Wolfenstein 3D port'],
     ['/home/node/.openclaw/tmp/etl-scripting-language', 'ETL scripting language'],
-    ['/home/node/.openclaw/tmp/autopilot-control-tower', 'Autopilot Control Tower'],
+    ['/home/node/.openclaw/tmp/autopilot-control-tower', 'Autopilot Control Tower workspace'],
   ];
   const out = [];
   for (const [repoPath, name] of candidates) if (await exists(repoPath)) out.push({ host: HOSTNAME, repoPath, name, key: projectKey(HOSTNAME, repoPath) });
