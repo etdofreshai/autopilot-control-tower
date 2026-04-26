@@ -16,6 +16,19 @@ const MAX_FILE_BYTES = 512 * 1024;
 
 const STAGES = ['plan', 'assign', 'build', 'review', 'integrate', 'learn'];
 const STOP_FILES = ['STOP_AUTOPILOT', 'STOP_AFTER_CURRENT_LOOP', 'STOP_ETL_AUTOPILOT', 'STOP_ETL_PARALLEL'];
+const REQUEST_FILES = ['.autopilot/request.md', 'docs/AUTOPILOT.md', 'docs/PROJECT_AUTOPILOT.md', 'state/autopilot.md', 'README.md'];
+const DOC_FILES = [
+  'README.md',
+  '.autopilot/program.md',
+  '.autopilot/task-taxonomy.md',
+  '.autopilot/evals.md',
+  '.autopilot/models/README.md',
+  'docs/AUTOPILOT.md',
+  'docs/AUTOPILOT_SUPERVISOR.md',
+  'docs/PROJECT_AUTOPILOT.md',
+  'docs/SPEC.md',
+  'state/autopilot.md',
+];
 
 function projectKey(host, repoPath) { return `${host}:${path.resolve(repoPath)}`; }
 function json(res, status, body) {
@@ -111,19 +124,123 @@ async function parseWaveSummaries(repo) {
       verificationRc: data.verificationRc,
       verificationTail: data.verificationTail || '',
       status: data.verificationRc === 0 && (!data.issues || data.issues.length === 0) ? 'passed' : (data.verificationRc === 0 ? 'issues' : 'failed'),
+      stageDetails: waveStageDetails(data, results),
     });
   }
   return waves;
 }
 
+function waveStageDetails(data, results) {
+  const models = results.map(r => r.model).filter(Boolean);
+  const issues = Array.isArray(data.issues) ? data.issues : [];
+  const merged = Array.isArray(data.merged) ? data.merged : [];
+  return {
+    plan: {
+      title: 'Plan',
+      summary: `Wave ${data.wave || 'unknown'} continued the active project request from repo autopilot docs/state.`,
+      bullets: ['Use project standing instructions and current repo state.', 'Prefer verified progress over uncommitted exploration.'],
+      artifacts: ['docs/AUTOPILOT.md', 'state/autopilot.md'],
+    },
+    assign: {
+      title: 'Assign',
+      summary: models.length ? `Assigned ${models.length} model worker(s).` : 'No model workers recorded.',
+      bullets: models.map((m, i) => `${m} → worker ${i + 1}`),
+      artifacts: results.map(r => r.log).filter(Boolean),
+    },
+    build: {
+      title: 'Build',
+      summary: `${results.length} worker result(s), max elapsed ${formatDuration(results.reduce((m, r) => Math.max(m, Number(r.elapsed || 0)), 0))}.`,
+      bullets: results.map(r => `${r.model || 'model'}: ${r.summary || 'no summary'} (${r.rc === 0 ? 'ok' : `rc=${r.rc}`})`),
+      artifacts: results.map(r => r.branch).filter(Boolean),
+    },
+    review: {
+      title: 'Review',
+      summary: issues.length ? `${issues.length} issue(s) recorded.` : 'No issues recorded in summary.',
+      bullets: issues.length ? issues : ['Implicit review via merge/test gates.'],
+      artifacts: [],
+    },
+    integrate: {
+      title: 'Integrate',
+      summary: `${merged.length} branch(es) merged; verification rc=${data.verificationRc}.`,
+      bullets: [
+        ...merged.map(b => `Merged ${b}`),
+        data.verificationTail ? `Verification tail: ${String(data.verificationTail).split('\n').filter(Boolean).slice(-3).join(' / ')}` : 'No verification tail recorded.',
+      ],
+      artifacts: [],
+    },
+    learn: {
+      title: 'Learn',
+      summary: issues.length ? 'Learning opportunity: capture failure pattern and assignment fit.' : 'Successful/quiet wave; capture what worked when useful.',
+      bullets: issues.length ? ['Record failed worker startup/merge/test patterns.', 'Update model/task-size/prompt learnings if repeated.'] : ['Track model usefulness, task size, prompt clarity, and test discipline.'],
+      artifacts: ['.autopilot/learnings.jsonl', '.autopilot/models/'],
+    },
+  };
+}
+
+async function firstExistingText(repo, paths) {
+  for (const rel of paths) {
+    const full = path.join(repo, rel);
+    if (await exists(full)) {
+      const raw = await fs.readFile(full, 'utf8').catch(() => '');
+      const lines = raw.split('\n').map(s => s.trim()).filter(Boolean);
+      const text = lines.find(l => !l.startsWith('#')) || lines[0] || '';
+      return { path: rel, text: text.slice(0, 600) };
+    }
+  }
+  return { path: null, text: 'No explicit request file yet. Add .autopilot/request.md to make the active request first-class.' };
+}
+
+async function projectDocs(repo) {
+  const docs = [];
+  for (const rel of DOC_FILES) {
+    const full = path.join(repo, rel);
+    if (!(await exists(full))) continue;
+    const raw = await fs.readFile(full, 'utf8').catch(() => '');
+    docs.push({ path: rel, title: rel.split('/').at(-1), preview: raw.split('\n').slice(0, 6).join('\n').slice(0, 700) });
+  }
+  const modelDir = path.join(repo, '.autopilot/models');
+  for (const name of await listFilesSafe(modelDir, /\.md$/)) {
+    const rel = `.autopilot/models/${name}`;
+    if (docs.some(d => d.path === rel)) continue;
+    const raw = await fs.readFile(path.join(repo, rel), 'utf8').catch(() => '');
+    docs.push({ path: rel, title: name, preview: raw.split('\n').slice(0, 6).join('\n').slice(0, 700) });
+  }
+  return docs;
+}
+
+async function projectLearnings(repo, waves) {
+  const file = path.join(repo, '.autopilot/learnings.jsonl');
+  const explicit = [];
+  if (await exists(file)) {
+    const raw = await fs.readFile(file, 'utf8').catch(() => '');
+    for (const line of raw.split('\n').filter(Boolean).slice(-50)) {
+      try { explicit.push(JSON.parse(line)); } catch { explicit.push({ scope: 'note', claim: line }); }
+    }
+  }
+  const recent = waves.slice(-25);
+  const total = recent.length || 1;
+  const passed = recent.filter(w => w.status === 'passed').length;
+  const failed = recent.filter(w => w.status === 'failed' || w.status === 'issues').length;
+  const avgElapsed = Math.round(recent.reduce((n, w) => n + Number(w.elapsedSeconds || 0), 0) / total);
+  return {
+    explicit,
+    generated: [
+      { scope: 'workflow', claim: `${passed}/${recent.length} recent waves passed cleanly.`, confidence: recent.length ? Math.min(0.9, 0.35 + recent.length / 50) : 0.2, evidence: { recentWaves: recent.length, passed, failed } },
+      { scope: 'task-size', claim: `Recent waves average ${formatDuration(avgElapsed)} max worker time; use this to decide whether task slices are too small or too large.`, confidence: recent.length ? 0.55 : 0.2, evidence: { avgElapsedSeconds: avgElapsed } },
+      { scope: 'prompt', claim: 'Make the active request explicit in .autopilot/request.md so every run can display what the user asked for.', confidence: 0.8, evidence: { source: 'dashboard gap' } },
+    ],
+  };
+}
+
 async function scanProject(host, repoPath) {
   const repo = validateProject(host, repoPath);
   if (!(await exists(repo))) throw Object.assign(new Error('repoPath does not exist'), { status: 404 });
-  const [git, waves, stateNames, logNames] = await Promise.all([
+  const [git, waves, stateNames, logNames, request] = await Promise.all([
     gitStatus(repo),
     parseWaveSummaries(repo),
     listFilesSafe(path.join(repo, 'state')),
     listFilesSafe(path.join(repo, 'logs')),
+    firstExistingText(repo, REQUEST_FILES),
   ]);
   const latestWave = waves.at(-1) || null;
   const stopState = {};
@@ -132,6 +249,7 @@ async function scanProject(host, repoPath) {
   const loop = stageLoop(latestWave, stopState, runningPidFiles);
   return {
     key: projectKey(host, repo), host, repoPath: repo,
+    request,
     git,
     latestWave,
     waveCount: waves.length,
@@ -143,6 +261,8 @@ async function scanProject(host, repoPath) {
       latestSupervisorLog: latestByName(logNames.filter(n => n.includes('autopilot') && n.endsWith('.log'))),
       latestWaveLog: latestByName(logNames.filter(n => n.includes('wave'))),
     },
+    docs: await projectDocs(repo),
+    learnings: await projectLearnings(repo, waves),
   };
 }
 
