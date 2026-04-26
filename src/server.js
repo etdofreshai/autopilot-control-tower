@@ -57,9 +57,12 @@ const AGENT_RUN_TOKEN = process.env.OPENCLAW_AGENT_TOKEN || '';
 const LOG_LEVEL = String(process.env.LOG_LEVEL || 'debug').toLowerCase();
 const LOG_LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 const LOG_MIN = LOG_LEVELS[LOG_LEVEL] || LOG_LEVELS.debug;
-const VERSION = '0.6.0-real-loop';
+const VERSION = '0.7.0-real-loop-notifications';
 const LOOP_TICK_MS = Math.max(1000, Number(process.env.AUTOPILOT_LOOP_TICK_MS || 5000));
 const MIN_LOOP_INTERVAL_SECONDS = 10;
+const DEFAULT_NOTIFY_CHANNEL = process.env.AUTOPILOT_NOTIFY_CHANNEL || 'telegram';
+const DEFAULT_NOTIFY_TARGET = process.env.AUTOPILOT_NOTIFY_TARGET || process.env.TELEGRAM_NOTIFY_TARGET || 'telegram:-5146898162';
+const DEFAULT_NOTIFY_EVERY = Math.max(1, Number(process.env.AUTOPILOT_NOTIFY_EVERY || 5));
 
 const DEFAULT_OVERSEER_PROMPT = `You are Autopilot Overseer. Keep your role simple and stable: receive the user request, spawn a small set of supervisor variants, assign each supervisor the same intent, and compare their final results. Do not do the project work yourself.`;
 
@@ -135,6 +138,7 @@ function blankLoop() {
     promptRevisions: [],
     history: [],
     agentRuns: [],
+    notifications: { enabled: Boolean(DEFAULT_NOTIFY_TARGET), channel: DEFAULT_NOTIFY_CHANNEL, target: DEFAULT_NOTIFY_TARGET, onStart: true, onFinish: true, every: DEFAULT_NOTIFY_EVERY },
     autopilot: { enabled: false, mode: 'agent', intervalSeconds: 300, lastTickAt: '', nextRunAt: '', lastError: '' },
     updatedAt: now(),
   };
@@ -145,6 +149,48 @@ function normalizeAutopilot(value = {}) {
   return { enabled: Boolean(value.enabled), mode: 'agent', intervalSeconds, lastTickAt: value.lastTickAt || '', nextRunAt: value.nextRunAt || '', lastError: value.lastError || '' };
 }
 function dueAtFrom(intervalSeconds) { return new Date(Date.now() + Math.max(MIN_LOOP_INTERVAL_SECONDS, Number(intervalSeconds || 300)) * 1000).toISOString(); }
+function normalizeNotifications(value = {}) {
+  return {
+    enabled: value.enabled !== false && Boolean(value.target || DEFAULT_NOTIFY_TARGET),
+    channel: String(value.channel || DEFAULT_NOTIFY_CHANNEL || 'telegram'),
+    target: String(value.target || DEFAULT_NOTIFY_TARGET || ''),
+    onStart: value.onStart !== false,
+    onFinish: value.onFinish !== false,
+    every: Math.max(1, Number(value.every || DEFAULT_NOTIFY_EVERY || 5)),
+  };
+}
+function runCommand(bin, args, opts = {}) {
+  return new Promise(resolve => {
+    const cp = spawn(bin, args, { cwd: opts.cwd || ROOT, env: opts.env || process.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '';
+    const t = setTimeout(() => { cp.kill('SIGKILL'); resolve({ rc: 124, out, err: err + 'timeout' }); }, opts.timeoutMs || 20000);
+    cp.stdout.on('data', d => out += d); cp.stderr.on('data', d => err += d);
+    cp.on('close', rc => { clearTimeout(t); resolve({ rc, out, err }); });
+    cp.on('error', e => { clearTimeout(t); resolve({ rc: 1, out, err: String(e) }); });
+  });
+}
+async function sendNotification(loop, text, reason = 'update') {
+  const n = normalizeNotifications(loop.notifications);
+  if (!n.enabled || !n.target || !text) return { skipped: true };
+  const args = ['message', 'send', '--channel', n.channel, '--target', n.target, '--message', text];
+  const cp = await runCommand(process.env.OPENCLAW_BIN || 'openclaw', args, { timeoutMs: 30000, env: { ...process.env, HOME: process.env.OPENCLAW_HOME || process.env.HOME || '/openclaw' } });
+  log(cp.rc === 0 ? 'info' : 'warn', 'notification.sent', { reason, channel: n.channel, target: n.target, rc: cp.rc, out: shortText(cp.out, 300), err: shortText(cp.err, 300) });
+  return cp;
+}
+function projectTitle(loop, repoPath) { return loop.name || path.basename(repoPath || '') || 'project'; }
+function runSummaryForNotification(loop, run, reply) {
+  const facts = realRunFacts(reply, run.rc);
+  const status = run.rc === 0 ? 'finished' : 'failed';
+  const next = facts.next ? `\nNext: ${facts.next}` : '';
+  const validation = facts.validationPassed ? 'validation passed' : 'validation unclear';
+  return `Autopilot ${status}: ${projectTitle(loop, run.repoPath)}\nRun: ${run.id}\nScore: ${facts.score}/100 · ${validation}\n${shortText((reply || '').split('\n').find(Boolean) || 'No summary text.', 350)}${next}`;
+}
+function everySummary(loop) {
+  const runs = (loop.agentRuns || []).filter(r => r.status === 'succeeded' || r.status === 'failed');
+  const recent = runs.slice(0, normalizeNotifications(loop.notifications).every);
+  const bullets = recent.map(r => `- ${r.id}: ${r.status}${r.output ? ` — ${shortText(String(r.output).split('\n').find(Boolean) || '', 160)}` : ''}`).join('\n');
+  return `Autopilot ${recent.length}-run summary: ${projectTitle(loop, recent[0]?.repoPath)}\n${bullets}`;
+}
 
 function runGit(repo, args, timeoutMs = 4000) {
   return new Promise(resolve => {
@@ -380,6 +426,7 @@ async function startAgentRun(host, repoPath, body = {}) {
   loop.agentRuns = [entry, ...(loop.agentRuns || [])].slice(0, 30);
   loop.status = 'agent running'; loop.stage = 'subagents'; loop.updatedAt = now();
   await saveProjectState(key, loop);
+  if (normalizeNotifications(loop.notifications).onStart) sendNotification(loop, `Autopilot started: ${projectTitle(loop, repo)}\nRun: ${id}\nRepo: ${repo}\nIntent: ${shortText(message, 500)}`, 'start').catch(e => logError('notification.start.error', e, { id }));
   await appendRunLog(id, `$ ${bin} ${args.map(a => JSON.stringify(a)).join(' ')}\n\n`);
   log('info', 'agent.spawn', { id, repo, bin, args, sessionId, agentId: agentId || 'default', thinking, timeout });
   const child = spawn(bin, args, { cwd: repo, env: { ...process.env, HOME: process.env.OPENCLAW_HOME || process.env.HOME || '/openclaw' }, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -404,8 +451,12 @@ async function startAgentRun(host, repoPath, body = {}) {
       latest.agentRuns = (latest.agentRuns || []).map(r => r.id === id ? { ...r, ...runPatch, updatedAt: now() } : r);
       applyRealRunLearning(latest, { id, rc, reply, err, parsed, sessionId });
       latest.history = [...(latest.history || []), { ts: now(), event: succeeded ? 'agent_completed' : 'agent_failed', id, rc, sessionId }].slice(-100);
+      const n = normalizeNotifications(latest.notifications);
+      const completedCount = (latest.agentRuns || []).filter(r => r.status === 'succeeded' || r.status === 'failed').length;
       all.projects[key] = latest;
       await writeJson(STATE_FILE, all);
+      if (n.onFinish) await sendNotification(latest, runSummaryForNotification(latest, { ...entry, id, rc, repoPath: repo }, reply), 'finish').catch(e => logError('notification.finish.error', e, { id }));
+      if (completedCount > 0 && completedCount % n.every === 0) await sendNotification(latest, everySummary(latest), 'every-n').catch(e => logError('notification.every.error', e, { id, completedCount }));
     })().catch(e => logError('agent.close.update_failed', e, { id, repo, sessionId }));
   });
   return entry;
@@ -419,11 +470,12 @@ async function configureAutopilot(host, repoPath, patch = {}) {
   const current = normalizeAutopilot(loop.autopilot);
   const enabled = patch.enabled ?? current.enabled;
   const intervalSeconds = Math.max(MIN_LOOP_INTERVAL_SECONDS, Number(patch.intervalSeconds || current.intervalSeconds || 300));
+  loop.notifications = normalizeNotifications({ ...(loop.notifications || {}), ...(patch.notifications || {}), target: patch.notificationTarget ?? patch.notifyTarget ?? loop.notifications?.target, every: patch.notifyEvery ?? loop.notifications?.every });
   loop.autopilot = { ...current, enabled: Boolean(enabled), mode: 'agent', intervalSeconds, nextRunAt: Boolean(enabled) ? (patch.runNow ? now() : (current.nextRunAt || dueAtFrom(intervalSeconds))) : '', lastError: Boolean(enabled) ? current.lastError : '' };
   loop.status = loop.autopilot.enabled ? `autopilot ${loop.autopilot.mode} loop enabled` : (loop.status || 'ready');
   loop.history = [...(loop.history || []), { ts: now(), event: loop.autopilot.enabled ? 'autopilot-enabled' : 'autopilot-disabled', autopilot: loop.autopilot }].slice(-100);
   loop.updatedAt = now(); all.projects[key] = loop; await writeJson(STATE_FILE, all);
-  log('info', 'autopilot.configure', { host, repoPath: repo, autopilot: loop.autopilot });
+  log('info', 'autopilot.configure', { host, repoPath: repo, autopilot: loop.autopilot, notifications: scrub(loop.notifications) });
   return loop;
 }
 const activeLoopTicks = new Set();

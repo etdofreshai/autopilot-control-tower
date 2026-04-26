@@ -150,10 +150,12 @@ function renderLoop() {
         <label>Model<input name="model" placeholder="gpt-5.5, opus, GLM..." value="${esc(l.model)}"></label>
         <label>OpenClaw agent id<input name="agentId" placeholder="blank = default agent" value="${esc(l.agentId || '')}"></label>
         <label>Loop interval seconds<input name="loopIntervalSeconds" type="number" min="10" value="${esc(l.autopilot?.intervalSeconds || 300)}"></label>
+        <label>Telegram notify target<input name="notificationTarget" placeholder="telegram:-5146898162" value="${esc(l.notifications?.target || '')}"></label>
+        <label>Summary every N runs<input name="notifyEvery" type="number" min="1" value="${esc(l.notifications?.every || 5)}"></label>
         <div class="toolbar align-end"><button>Save</button><button type="button" class="${running ? 'danger' : ''}" onclick="${running ? 'stopBackgroundLoop()' : 'startBackgroundLoop()'}">${running ? 'Stop loop' : 'Start loop'}</button></div>
       </form>
     </section>
-    <section class="card"><h2>Status</h2>${autopilotStatus(l.autopilot)}</section>
+    <section class="card"><h2>Status</h2>${autopilotStatus(l.autopilot)}${notificationStatus(l.notifications)}</section>
     <section class="card"><h2>Learnings / self-improvement</h2>${learningList(l.learnings)}${promptRevisions(l.promptRevisions)}</section>
     <section class="card"><h2>Latest evaluation</h2>${evaluation((l.evaluations || []).at(-1))}</section>
     <section class="card"><h2>Real OpenClaw runs</h2>${agentRuns(l.agentRuns)}</section>
@@ -163,6 +165,9 @@ function renderLoop() {
 function autopilotStatus(a={}) {
   const cls = a.enabled ? 'good' : 'warn';
   return `<p><span class="pill ${cls}">${a.enabled ? 'running' : 'stopped'}</span> real OpenClaw loop every ${esc(a.intervalSeconds || 300)}s</p><p class="muted mono">last run: ${esc(a.lastTickAt || 'never')} · next run: ${esc(a.nextRunAt || 'not scheduled')}</p>${a.lastError ? `<pre class="mini-pre bad">${esc(a.lastError)}</pre>` : ''}`;
+}
+function notificationStatus(n={}) {
+  return `<p><span class="pill ${n.enabled ? 'good' : 'warn'}">${n.enabled ? 'notifications on' : 'notifications off'}</span> start/finish + every ${esc(n.every || 5)} run(s)</p><p class="muted mono">${esc(n.channel || 'telegram')} → ${esc(n.target || 'not set')}</p>`;
 }
 
 function stageCard(x) { return `<div class="stage ${esc(x.status)}"><h3>${esc(x.stage)}</h3><span class="pill">${esc(x.status)}</span><p>${esc(x.summary)}</p></div>`; }
@@ -190,7 +195,7 @@ async function saveConfig(e) {
   e.preventDefault();
   clientLog('ui.config.save.start', { current: state.current });
   const p = currentProject(), fd = new FormData(e.target);
-  state.snapshot.loop = await api('/api/config', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, intent: fd.get('intent'), model: fd.get('model'), overseerPrompt: fd.get('overseerPrompt'), supervisorPrompt: fd.get('supervisorPrompt'), variantCount: fd.get('variantCount'), agentId: fd.get('agentId') }) });
+  state.snapshot.loop = await api('/api/config', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, intent: fd.get('intent'), model: fd.get('model'), overseerPrompt: fd.get('overseerPrompt'), supervisorPrompt: fd.get('supervisorPrompt'), variantCount: fd.get('variantCount'), agentId: fd.get('agentId'), notifications: { target: fd.get('notificationTarget'), every: fd.get('notifyEvery') } }) });
   await refreshCurrent();
   clientLog('ui.config.save.complete', { current: state.current });
 }
@@ -204,9 +209,9 @@ async function startBackgroundLoop() {
   localStorage.setItem('openclawAgentToken', token);
   try {
     if (f) {
-      await api('/api/config', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, intent: fd.get('intent'), model: fd.get('model'), agentId: fd.get('agentId') }) });
+      await api('/api/config', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, intent: fd.get('intent'), model: fd.get('model'), agentId: fd.get('agentId'), notifications: { target: fd.get('notificationTarget'), every: fd.get('notifyEvery') } }) });
     }
-    await api('/api/autopilot', { method:'POST', headers:{'content-type':'application/json', 'x-agent-token': token}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, enabled:true, runNow:true, intervalSeconds: fd.get('loopIntervalSeconds') || state.snapshot.loop.autopilot?.intervalSeconds || 300 }) });
+    await api('/api/autopilot', { method:'POST', headers:{'content-type':'application/json', 'x-agent-token': token}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, enabled:true, runNow:true, intervalSeconds: fd.get('loopIntervalSeconds') || state.snapshot.loop.autopilot?.intervalSeconds || 300, notificationTarget: fd.get('notificationTarget'), notifyEvery: fd.get('notifyEvery') }) });
     await refreshCurrent();
   } catch (e) { alert(e.message); }
 }
