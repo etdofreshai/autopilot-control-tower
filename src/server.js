@@ -42,9 +42,9 @@ function validateProject(host, repoPath) {
 async function defaultProjects() {
   const candidates = [
     ['/app', 'Autopilot Control Tower container'],
-    ['/home/node/.openclaw/tmp/Wolfenstein 3D port', 'Wolfenstein 3D port'],
-    ['/home/node/.openclaw/tmp/etl-scripting-language', 'ETL scripting language'],
-    ['/home/node/.openclaw/tmp/autopilot-control-tower', 'Autopilot Control Tower workspace'],
+    ['/openclaw/.openclaw/tmp/Wolfenstein 3D port', 'Wolfenstein 3D port'],
+    ['/openclaw/.openclaw/tmp/etl-scripting-language', 'ETL scripting language'],
+    ['/openclaw/.openclaw/tmp/autopilot-control-tower', 'Autopilot Control Tower workspace'],
   ];
   const out = [];
   for (const [repoPath, name] of candidates) if (await exists(repoPath)) out.push({ host: HOSTNAME, repoPath, name, key: projectKey(HOSTNAME, repoPath) });
@@ -60,7 +60,7 @@ async function loadProjects() {
 
 function runGit(repo, args, timeoutMs = 4000) {
   return new Promise(resolve => {
-    const cp = spawn('git', args, { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
+    const cp = spawn('git', ['-c', 'safe.directory=*', ...args], { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '', err = '';
     const t = setTimeout(() => { cp.kill('SIGKILL'); resolve({ rc: 124, out, err: err + 'timeout' }); }, timeoutMs);
     cp.stdout.on('data', d => out += d);

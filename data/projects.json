@@ -8,21 +8,21 @@
     },
     {
       "host": "233b25d7bf4b",
-      "repoPath": "/home/node/.openclaw/tmp/Wolfenstein 3D port",
+      "repoPath": "/openclaw/.openclaw/tmp/Wolfenstein 3D port",
       "name": "Wolfenstein 3D port",
-      "key": "233b25d7bf4b:/home/node/.openclaw/tmp/Wolfenstein 3D port"
+      "key": "233b25d7bf4b:/openclaw/.openclaw/tmp/Wolfenstein 3D port"
     },
     {
       "host": "233b25d7bf4b",
-      "repoPath": "/home/node/.openclaw/tmp/etl-scripting-language",
+      "repoPath": "/openclaw/.openclaw/tmp/etl-scripting-language",
       "name": "ETL scripting language",
-      "key": "233b25d7bf4b:/home/node/.openclaw/tmp/etl-scripting-language"
+      "key": "233b25d7bf4b:/openclaw/.openclaw/tmp/etl-scripting-language"
     },
     {
       "host": "233b25d7bf4b",
-      "repoPath": "/home/node/.openclaw/tmp/autopilot-control-tower",
+      "repoPath": "/openclaw/.openclaw/tmp/autopilot-control-tower",
       "name": "Autopilot Control Tower workspace",
-      "key": "233b25d7bf4b:/home/node/.openclaw/tmp/autopilot-control-tower"
+      "key": "233b25d7bf4b:/openclaw/.openclaw/tmp/autopilot-control-tower"
     }
   ]
 }
