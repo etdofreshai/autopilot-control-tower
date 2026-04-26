@@ -3,63 +3,39 @@ import { promises as fs } from 'node:fs';
 import fssync from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const DATA_DIR = path.join(ROOT, 'data');
 const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
-const SETTINGS_FILE = path.join(DATA_DIR, 'project-settings.json');
+const STATE_FILE = path.join(DATA_DIR, 'loop-state.json');
 const PORT = Number(process.env.PORT || 8787);
 const HOSTNAME = os.hostname();
 const MAX_FILE_BYTES = 512 * 1024;
+const STAGES = ['request', 'overseer', 'supervisors', 'subagents', 'evaluate', 'improve'];
 
-const STAGES = ['plan', 'assign', 'build', 'review', 'integrate', 'learn'];
-const STOP_FILES = ['STOP_AUTOPILOT', 'STOP_AFTER_CURRENT_LOOP', 'STOP_ETL_AUTOPILOT', 'STOP_ETL_PARALLEL'];
-const REQUEST_FILES = ['.autopilot/request.md', 'docs/AUTOPILOT.md', 'docs/PROJECT_AUTOPILOT.md', 'state/autopilot.md', 'README.md'];
-const DOC_FILES = [
-  'README.md',
-  '.autopilot/program.md',
-  '.autopilot/task-taxonomy.md',
-  '.autopilot/evals.md',
-  '.autopilot/models/README.md',
-  'docs/AUTOPILOT.md',
-  'docs/AUTOPILOT_SUPERVISOR.md',
-  'docs/PROJECT_AUTOPILOT.md',
-  'docs/SPEC.md',
-  'state/autopilot.md',
-];
+const DEFAULT_OVERSEER_PROMPT = `You are Autopilot Overseer. Keep your role simple and stable: receive the user request, spawn a small set of supervisor variants, assign each supervisor the same intent, and compare their final results. Do not do the project work yourself.`;
+
+const DEFAULT_SUPERVISOR_PROMPT = `You are Autopilot Supervisor. Your job is to satisfy the user's intent in one shot whenever possible.\n\nProcess:\n1. Convert the request into clear acceptance criteria.\n2. Decide what supervisor strategy should be used for this request.\n3. Spawn focused sub-agents with precise role prompts.\n4. Evaluate both the supervisor strategy and the sub-agent guidance.\n5. Integrate sub-agent results into one coherent deliverable.\n6. If feedback or evaluation shows a gap, update the supervisor prompt and sub-agent guidance so the next one-shot attempt is better.`;
 
 function projectKey(host, repoPath) { return `${host}:${path.resolve(repoPath)}`; }
-function json(res, status, body) {
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-  res.end(JSON.stringify(body, null, 2));
-}
-function text(res, status, body, type = 'text/plain; charset=utf-8') {
-  res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store' });
-  res.end(body);
-}
+function now() { return new Date().toISOString(); }
+function json(res, status, body) { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(body, null, 2)); }
+function text(res, status, body, type = 'text/plain; charset=utf-8') { res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store' }); res.end(body); }
 async function exists(p) { try { await fs.access(p); return true; } catch { return false; } }
-async function readJson(p, fallback = null) { try { return JSON.parse(await fs.readFile(p, 'utf8')); } catch { return fallback; } }
+async function readJson(p, fallback) { try { return JSON.parse(await fs.readFile(p, 'utf8')); } catch { return fallback; } }
 async function writeJson(p, value) { await fs.mkdir(path.dirname(p), { recursive: true }); await fs.writeFile(p, JSON.stringify(value, null, 2) + '\n'); }
-
 function validateProject(host, repoPath) {
   if (!host || !repoPath) throw Object.assign(new Error('host and repoPath are required'), { status: 400 });
-  // In this MVP, host is a project-identity label. The deployed container operates
-  // on mounted local paths; future versions can route by host to remote agents.
   if (!path.isAbsolute(repoPath)) throw Object.assign(new Error('repoPath must be absolute'), { status: 400 });
   if (repoPath.includes('\0')) throw Object.assign(new Error('invalid repoPath'), { status: 400 });
   return path.resolve(repoPath);
 }
 
 async function defaultProjects() {
-  const candidates = [
-    ['/app', 'Autopilot Control Tower container'],
-    ['/openclaw/.openclaw/tmp/Wolfenstein 3D port', 'Wolfenstein 3D port'],
-    ['/openclaw/.openclaw/tmp/etl-scripting-language', 'ETL scripting language'],
-    ['/openclaw/.openclaw/tmp/autopilot-control-tower', 'Autopilot Control Tower workspace'],
-  ];
+  const candidates = [['/app', 'Autopilot Control Tower container'], ['/openclaw/.openclaw/tmp/autopilot-control-tower', 'Autopilot Control Tower workspace'], ['/home/node/.openclaw/tmp/autopilot-control-tower', 'Autopilot Control Tower repo']];
   const out = [];
   for (const [repoPath, name] of candidates) if (await exists(repoPath)) out.push({ host: HOSTNAME, repoPath, name, key: projectKey(HOSTNAME, repoPath) });
   return out;
@@ -67,394 +43,192 @@ async function defaultProjects() {
 async function loadProjects() {
   const stored = await readJson(PROJECTS_FILE, null);
   if (Array.isArray(stored?.projects)) return stored.projects;
-  const seeded = await defaultProjects();
-  await writeJson(PROJECTS_FILE, { projects: seeded });
-  return seeded;
+  const projects = await defaultProjects(); await writeJson(PROJECTS_FILE, { projects }); return projects;
 }
+async function loadState() { const state = await readJson(STATE_FILE, { projects: {} }); state.projects ||= {}; return state; }
+async function saveProjectState(key, projectState) { const all = await loadState(); all.projects[key] = projectState; await writeJson(STATE_FILE, all); return projectState; }
+function blankLoop() {
+  return {
+    intent: '',
+    model: 'gpt-5.5',
+    overseerPrompt: DEFAULT_OVERSEER_PROMPT,
+    supervisorPrompt: DEFAULT_SUPERVISOR_PROMPT,
+    variantCount: 3,
+    status: 'not configured',
+    stage: 'request',
+    cycle: 0,
+    score: 0,
+    supervisorScore: 0,
+    subAgentScore: 0,
+    metrics: { correctness: 0, cost: 0, requests: 0, duration: 0 },
+    weights: { correctness: 0.7, cost: 0.1, requests: 0.1, duration: 0.1 },
+    oneShot: null,
+    variants: [],
+    evaluations: [],
+    learnings: [],
+    promptRevisions: [],
+    history: [],
+    updatedAt: now(),
+  };
+}
+function normalizedLoop(all, key) { return { ...blankLoop(), ...(all.projects?.[key] || {}) }; }
 
 function runGit(repo, args, timeoutMs = 4000) {
   return new Promise(resolve => {
     const cp = spawn('git', ['-c', 'safe.directory=*', ...args], { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '', err = '';
     const t = setTimeout(() => { cp.kill('SIGKILL'); resolve({ rc: 124, out, err: err + 'timeout' }); }, timeoutMs);
-    cp.stdout.on('data', d => out += d);
-    cp.stderr.on('data', d => err += d);
-    cp.on('close', rc => { clearTimeout(t); resolve({ rc, out, err }); });
-    cp.on('error', e => { clearTimeout(t); resolve({ rc: 1, out, err: String(e) }); });
+    cp.stdout.on('data', d => out += d); cp.stderr.on('data', d => err += d);
+    cp.on('close', rc => { clearTimeout(t); resolve({ rc, out, err }); }); cp.on('error', e => { clearTimeout(t); resolve({ rc: 1, out, err: String(e) }); });
   });
 }
-
 async function gitStatus(repo) {
-  const [head, branch, dirty, recent] = await Promise.all([
-    runGit(repo, ['rev-parse', '--short', 'HEAD']),
-    runGit(repo, ['branch', '--show-current']),
-    runGit(repo, ['status', '--porcelain']),
-    runGit(repo, ['log', '--oneline', '-8']),
-  ]);
-  return {
-    head: head.rc === 0 ? head.out.trim() : 'unknown',
-    branch: branch.rc === 0 ? branch.out.trim() : 'unknown',
-    dirtyFiles: dirty.rc === 0 ? dirty.out.split('\n').filter(Boolean).length : null,
-    recentCommits: recent.rc === 0 ? recent.out.split('\n').filter(Boolean) : [],
-  };
+  const [head, branch, dirty, recent] = await Promise.all([runGit(repo, ['rev-parse', '--short', 'HEAD']), runGit(repo, ['branch', '--show-current']), runGit(repo, ['status', '--porcelain']), runGit(repo, ['log', '--oneline', '-6'])]);
+  return { head: head.rc === 0 ? head.out.trim() : 'unknown', branch: branch.rc === 0 ? branch.out.trim() : 'unknown', dirtyFiles: dirty.rc === 0 ? dirty.out.split('\n').filter(Boolean).length : null, recentCommits: recent.rc === 0 ? recent.out.split('\n').filter(Boolean) : [] };
 }
-
-async function listFilesSafe(dir, re = /.*/) {
-  try { return (await fs.readdir(dir)).filter(n => re.test(n)).sort(); } catch { return []; }
+function loopCards(loop) { return STAGES.map(stage => ({ stage, status: stage === loop.stage ? 'active' : STAGES.indexOf(stage) < STAGES.indexOf(loop.stage) ? 'done' : 'pending', summary: stageSummary(stage, loop) })); }
+function stageSummary(stage, loop) {
+  if (stage === 'request') return loop.intent ? 'User intent captured for one-shot attempt.' : 'Capture the user request.';
+  if (stage === 'overseer') return 'Static overseer spawns supervisor variants; it does not do project work.';
+  if (stage === 'supervisors') return `${loop.variants.length || loop.variantCount} supervisor variant(s) competing on the same request.`;
+  if (stage === 'subagents') return 'Each supervisor spawns and manages its own sub-agent team.';
+  if (stage === 'evaluate') return `Overall ${loop.score}/100 · correctness ${loop.metrics?.correctness || 0}/100 · duration ${loop.metrics?.duration || 0}/100.`;
+  return `${loop.promptRevisions.length} prompt/guidance revision(s).`;
 }
-function latestByName(names) { return names.sort().at(-1) || null; }
-function tailText(raw, maxLines = 120, maxChars = 20000) {
-  const tail = String(raw || '').slice(-maxChars);
-  return tail.split('\n').slice(-maxLines).join('\n');
+function acceptanceCriteria(intent) {
+  const trimmed = intent.trim();
+  return [
+    'The delivered result directly addresses the user request.',
+    'The supervisor decomposes work into clear sub-agent prompts only when useful.',
+    'The final answer is integrated, not a pile of worker outputs.',
+    trimmed.length > 80 ? `Preserve this specific intent: ${trimmed.slice(0, 220)}` : 'Ask for more detail only if the intent is unsafe or impossible.',
+  ];
 }
-
-async function loadSettings() {
-  const data = await readJson(SETTINGS_FILE, { projects: {} });
-  return data && typeof data === 'object' ? data : { projects: {} };
+function makeVariants(loop) {
+  const styles = ['Direct one-shot supervisor', 'Planner/integrator supervisor', 'Evaluation-first supervisor'];
+  const subRoles = ['Acceptance criteria analyst', 'Builder / implementer', 'Reviewer / gap finder'];
+  return Array.from({ length: Math.max(1, Math.min(6, Number(loop.variantCount || 3))) }, (_, i) => ({
+    id: String.fromCharCode(65 + i),
+    strategy: styles[i] || `Supervisor strategy ${i + 1}`,
+    supervisorPrompt: `${loop.supervisorPrompt}\n\nSupervisor variant ${String.fromCharCode(65 + i)}: ${styles[i] || 'Try a distinct supervision strategy.'}`,
+    subAgents: subRoles.map((role, j) => ({
+      id: `${String.fromCharCode(65 + i)}${j + 1}`,
+      role,
+      prompt: `${role}: help Supervisor ${String.fromCharCode(65 + i)} satisfy the user's intent in one shot. Be concrete, terse, and evaluation-oriented.`,
+      score: 0,
+      finding: '',
+    })),
+    resultSummary: `Prototype ${styles[i] || 'supervisor'} run generated from supervisor prompt.`,
+    supervisorScore: 0,
+    subAgentScore: 0,
+    metrics: { correctness: 0, cost: 0, requests: 0, duration: 0 },
+    usage: { estimatedTokens: 0, requestCount: 0, durationSeconds: 0, estimatedCostUsd: 0 },
+    score: 0,
+  }));
 }
-async function settingsFor(host, repoPath) {
-  const repo = validateProject(host, repoPath);
-  const all = await loadSettings();
-  const key = projectKey(host, repo);
-  return all.projects?.[key] || {
-    notificationPolicy: 'failures',
-    notifyEveryWaves: 5,
-    telegramTarget: '',
-    startMode: 'request-file',
-    startCommand: '',
-  };
+function weightedScore(metrics, weights) {
+  return Math.round(
+    metrics.correctness * weights.correctness +
+    metrics.cost * weights.cost +
+    metrics.requests * weights.requests +
+    metrics.duration * weights.duration
+  );
 }
-async function saveSettings(host, repoPath, patch) {
-  const repo = validateProject(host, repoPath);
-  const all = await loadSettings();
-  all.projects ||= {};
-  const key = projectKey(host, repo);
-  all.projects[key] = { ...(await settingsFor(host, repo)), ...patch };
-  await writeJson(SETTINGS_FILE, all);
-  return all.projects[key];
+function evaluateVariants(loop) {
+  const criteria = acceptanceCriteria(loop.intent);
+  const weights = loop.weights || { correctness: 0.7, cost: 0.1, requests: 0.1, duration: 0.1 };
+  const promptStrength = Math.min(22, Math.floor(loop.supervisorPrompt.length / 100));
+  const intentStrength = loop.intent.trim().length > 20 ? 24 : 8;
+  const variants = (loop.variants.length ? loop.variants : makeVariants(loop)).map((v, i) => {
+    const subAgents = (v.subAgents || []).map((sa, j) => ({
+      ...sa,
+      score: Math.min(100, intentStrength + 18 + j * 4 + Math.min(loop.cycle * 3, 12)),
+      finding: `${sa.role} produced guidance for Supervisor ${v.id}.`,
+    }));
+    const usage = {
+      estimatedTokens: 900 + i * 350 + subAgents.length * 450,
+      requestCount: 1 + subAgents.length,
+      durationSeconds: 45 + i * 12 + subAgents.length * 18,
+      estimatedCostUsd: Number((0.004 + i * 0.002 + subAgents.length * 0.003).toFixed(3)),
+    };
+    const subAgentScore = Math.round(subAgents.reduce((n, sa) => n + sa.score, 0) / Math.max(1, subAgents.length));
+    const supervisorScore = Math.min(100, intentStrength + promptStrength + 20 + i * 5 + Math.min(loop.cycle * 4, 16));
+    const correctness = Math.round(supervisorScore * 0.65 + subAgentScore * 0.35);
+    const metrics = {
+      correctness,
+      cost: Math.max(0, 100 - Math.round(usage.estimatedCostUsd * 1800)),
+      requests: Math.max(0, 100 - usage.requestCount * 8),
+      duration: Math.max(0, 100 - Math.round(usage.durationSeconds / 2)),
+    };
+    const score = weightedScore(metrics, weights);
+    return { ...v, subAgents, supervisorScore, subAgentScore, metrics, usage, score };
+  });
+  const best = variants.reduce((a, b) => b.score > a.score ? b : a, variants[0]);
+  const gaps = [];
+  if (best.metrics.correctness < 85) gaps.push('Correctness is the highest-weight metric: improve acceptance criteria, integration, and review.');
+  if (best.metrics.cost < 80) gaps.push('Cost/tokens are high; reduce redundant sub-agent work.');
+  if (best.metrics.requests < 80) gaps.push('Too many requests; use fewer or more focused sub-agents.');
+  if (best.metrics.duration < 80) gaps.push('Duration is high; prefer faster supervisor/sub-agent handoffs.');
+  if (!loop.supervisorPrompt.toLowerCase().includes('sub-agent')) gaps.push('Prompt should explicitly explain how to spawn and manage sub-agents.');
+  return { ts: now(), cycle: loop.cycle, criteria, weights, variants, bestVariant: best.id, score: best.score, supervisorScore: best.supervisorScore, subAgentScore: best.subAgentScore, metrics: best.metrics, usage: best.usage, gaps, summary: best.score >= 85 ? 'Hierarchy performs well across correctness, cost, requests, and duration.' : 'Use the comparison to improve the hierarchy prompts and sub-agent guidance.' };
 }
-async function appendProjectEvent(repo, event) {
-  const state = path.join(repo, 'state');
-  await fs.mkdir(state, { recursive: true });
-  const line = JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n';
-  await fs.appendFile(path.join(state, 'autopilot-control-events.jsonl'), line, 'utf8');
+function revisePrompt(loop, ev) {
+  const additions = [
+    'Before final delivery, score your result against the acceptance criteria from 0-100.',
+    'If using sub-agents, assign each one a narrow role, explicit output contract, and review criteria.',
+    'The supervisor should compare sub-agent outputs, resolve conflicts, and integrate them into one final answer.',
+    'Prefer completing the user intent in one shot; ask follow-up questions only for hard blockers.',
+  ];
+  const missing = additions.filter(line => !loop.supervisorPrompt.includes(line));
+  if (!missing.length && !ev?.gaps?.length) return loop.supervisorPrompt;
+  return `${loop.supervisorPrompt.trim()}\n\nLearned supervisor rules:\n${missing.map(x => `- ${x}`).join('\n') || `- ${ev.gaps[0]}`}`;
 }
-async function startProject(host, repoPath, body = {}) {
-  const repo = validateProject(host, repoPath);
-  const settings = await settingsFor(host, repo);
-  const request = {
-    action: 'start-requested',
-    request: body.request || 'Continue current autopilot job',
-    notificationPolicy: settings.notificationPolicy,
-    notifyEveryWaves: settings.notifyEveryWaves,
-    telegramTarget: settings.telegramTarget,
-    startMode: settings.startMode,
-    status: settings.startMode === 'direct-command' ? 'starting' : 'queued-for-openclaw',
-  };
-  await appendProjectEvent(repo, request);
-  await fs.writeFile(path.join(repo, 'state', 'AUTOPILOT_START_REQUEST.json'), JSON.stringify(request, null, 2) + '\n', 'utf8');
-
-  if (settings.startMode === 'direct-command') {
-    if (!settings.startCommand?.trim()) throw Object.assign(new Error('startCommand is required for direct-command mode'), { status: 400 });
-    await fs.mkdir(path.join(repo, 'logs'), { recursive: true });
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const logPath = path.join(repo, 'logs', `controltower-start-${stamp}.log`);
-    const out = fssync.openSync(logPath, 'a');
-    const child = spawn(settings.startCommand, {
-      cwd: repo,
-      shell: true,
-      detached: true,
-      stdio: ['ignore', out, out],
-      env: {
-        ...process.env,
-        HOME: process.env.OPENCLAW_HOME || '/openclaw',
-        PATH: `${process.env.OPENCLAW_HOME || '/openclaw'}/.local/bin:${process.env.PATH || ''}`,
-        AUTOPILOT_REQUEST: request.request,
-        AUTOPILOT_TELEGRAM_TARGET: settings.telegramTarget || '',
-      },
-    });
-    child.unref();
-    const started = { action: 'process-started', pid: child.pid, command: settings.startCommand, log: path.relative(repo, logPath), status: 'running' };
-    await appendProjectEvent(repo, started);
-    await fs.writeFile(path.join(repo, 'state', 'AUTOPILOT_CONTROLTOWER_PID'), String(child.pid) + '\n', 'utf8');
-    return { ok: true, mode: 'direct-command', message: `Started autopilot command as pid ${child.pid}.`, request, process: started };
-  }
-
-  return { ok: true, mode: 'request-file', message: 'Start request recorded in repo state. Switch Settings → Start mode to direct-command to launch from the page.', request };
+async function configureLoop(host, repoPath, patch) {
+  const repo = validateProject(host, repoPath); const key = projectKey(host, repo); const current = normalizedLoop(await loadState(), key);
+  const next = { ...current, intent: String(patch.intent ?? current.intent ?? ''), model: String(patch.model ?? current.model ?? 'gpt-5.5'), overseerPrompt: String(patch.overseerPrompt ?? current.overseerPrompt ?? DEFAULT_OVERSEER_PROMPT), supervisorPrompt: String(patch.supervisorPrompt ?? current.supervisorPrompt ?? DEFAULT_SUPERVISOR_PROMPT), variantCount: Number(patch.variantCount || current.variantCount || 3), status: 'ready', stage: 'request', updatedAt: now() };
+  next.history = [...(current.history || []), { ts: now(), event: 'configured', intent: next.intent, model: next.model, variantCount: next.variantCount }].slice(-100);
+  return saveProjectState(key, next);
 }
-async function liveProject(host, repoPath) {
-  const repo = validateProject(host, repoPath);
-  const logs = path.join(repo, 'logs');
-  const names = await listFilesSafe(logs);
-  const preferred = latestByName(names.filter(n => n.includes('parallel-autopilot') || n.includes('autopilot-supervisor'))) || latestByName(names.filter(n => n.includes('wave'))) || latestByName(names);
-  const eventsPath = path.join(repo, 'state', 'autopilot-control-events.jsonl');
-  const logText = preferred ? await fs.readFile(path.join(logs, preferred), 'utf8').catch(e => String(e)) : 'No live log file found yet.';
-  const eventText = await fs.readFile(eventsPath, 'utf8').catch(() => '');
-  return { logFile: preferred ? `logs/${preferred}` : null, logTail: tailText(logText, 160), eventsTail: tailText(eventText, 60) };
-}
-
-async function parseWaveSummaries(repo) {
-  const logs = path.join(repo, 'logs');
-  const names = await listFilesSafe(logs, /^parallel-wave-.*-summary\.json$/);
-  const waves = [];
-  for (const name of names.slice(-100)) {
-    const data = await readJson(path.join(logs, name), null);
-    if (!data) continue;
-    const results = Array.isArray(data.results) ? data.results : [];
-    waves.push({
-      id: String(data.wave || name),
-      file: `logs/${name}`,
-      head: data.head || null,
-      base: data.base || null,
-      results,
-      models: results.map(r => r.model).filter(Boolean),
-      elapsedSeconds: results.reduce((m, r) => Math.max(m, Number(r.elapsed || 0)), 0),
-      mergedCount: Array.isArray(data.merged) ? data.merged.length : 0,
-      issues: Array.isArray(data.issues) ? data.issues : [],
-      verificationRc: data.verificationRc,
-      verificationTail: data.verificationTail || '',
-      status: data.verificationRc === 0 && (!data.issues || data.issues.length === 0) ? 'passed' : (data.verificationRc === 0 ? 'issues' : 'failed'),
-      stageDetails: waveStageDetails(data, results),
-    });
-  }
-  return waves;
-}
-
-function waveStageDetails(data, results) {
-  const models = results.map(r => r.model).filter(Boolean);
-  const issues = Array.isArray(data.issues) ? data.issues : [];
-  const merged = Array.isArray(data.merged) ? data.merged : [];
-  return {
-    plan: {
-      title: 'Plan',
-      summary: `Wave ${data.wave || 'unknown'} continued the active project request from repo autopilot docs/state.`,
-      bullets: ['Use project standing instructions and current repo state.', 'Prefer verified progress over uncommitted exploration.'],
-      artifacts: ['docs/AUTOPILOT.md', 'state/autopilot.md'],
-    },
-    assign: {
-      title: 'Assign',
-      summary: models.length ? `Assigned ${models.length} model worker(s).` : 'No model workers recorded.',
-      bullets: models.map((m, i) => `${m} → worker ${i + 1}`),
-      artifacts: results.map(r => r.log).filter(Boolean),
-    },
-    build: {
-      title: 'Build',
-      summary: `${results.length} worker result(s), max elapsed ${formatDuration(results.reduce((m, r) => Math.max(m, Number(r.elapsed || 0)), 0))}.`,
-      bullets: results.map(r => `${r.model || 'model'}: ${r.summary || 'no summary'} (${r.rc === 0 ? 'ok' : `rc=${r.rc}`})`),
-      artifacts: results.map(r => r.branch).filter(Boolean),
-    },
-    review: {
-      title: 'Review',
-      summary: issues.length ? `${issues.length} issue(s) recorded.` : 'No issues recorded in summary.',
-      bullets: issues.length ? issues : ['Implicit review via merge/test gates.'],
-      artifacts: [],
-    },
-    integrate: {
-      title: 'Integrate',
-      summary: `${merged.length} branch(es) merged; verification rc=${data.verificationRc}.`,
-      bullets: [
-        ...merged.map(b => `Merged ${b}`),
-        data.verificationTail ? `Verification tail: ${String(data.verificationTail).split('\n').filter(Boolean).slice(-3).join(' / ')}` : 'No verification tail recorded.',
-      ],
-      artifacts: [],
-    },
-    learn: {
-      title: 'Learn',
-      summary: issues.length ? 'Learning opportunity: capture failure pattern and assignment fit.' : 'Successful/quiet wave; capture what worked when useful.',
-      bullets: issues.length ? ['Record failed worker startup/merge/test patterns.', 'Update model/task-size/prompt learnings if repeated.'] : ['Track model usefulness, task size, prompt clarity, and test discipline.'],
-      artifacts: ['.autopilot/learnings.jsonl', '.autopilot/models/'],
-    },
-  };
-}
-
-async function firstExistingText(repo, paths) {
-  for (const rel of paths) {
-    const full = path.join(repo, rel);
-    if (await exists(full)) {
-      const raw = await fs.readFile(full, 'utf8').catch(() => '');
-      const lines = raw.split('\n').map(s => s.trim()).filter(Boolean);
-      const text = lines.find(l => !l.startsWith('#')) || lines[0] || '';
-      return { path: rel, text: text.slice(0, 600) };
-    }
-  }
-  return { path: null, text: 'No explicit request file yet. Add .autopilot/request.md to make the active request first-class.' };
-}
-
-async function projectDocs(repo) {
-  const docs = [];
-  for (const rel of DOC_FILES) {
-    const full = path.join(repo, rel);
-    if (!(await exists(full))) continue;
-    const raw = await fs.readFile(full, 'utf8').catch(() => '');
-    docs.push({ path: rel, title: rel.split('/').at(-1), preview: raw.split('\n').slice(0, 6).join('\n').slice(0, 700) });
-  }
-  const modelDir = path.join(repo, '.autopilot/models');
-  for (const name of await listFilesSafe(modelDir, /\.md$/)) {
-    const rel = `.autopilot/models/${name}`;
-    if (docs.some(d => d.path === rel)) continue;
-    const raw = await fs.readFile(path.join(repo, rel), 'utf8').catch(() => '');
-    docs.push({ path: rel, title: name, preview: raw.split('\n').slice(0, 6).join('\n').slice(0, 700) });
-  }
-  return docs;
-}
-
-async function projectLearnings(repo, waves) {
-  const file = path.join(repo, '.autopilot/learnings.jsonl');
-  const explicit = [];
-  if (await exists(file)) {
-    const raw = await fs.readFile(file, 'utf8').catch(() => '');
-    for (const line of raw.split('\n').filter(Boolean).slice(-50)) {
-      try { explicit.push(JSON.parse(line)); } catch { explicit.push({ scope: 'note', claim: line }); }
-    }
-  }
-  const recent = waves.slice(-25);
-  const total = recent.length || 1;
-  const passed = recent.filter(w => w.status === 'passed').length;
-  const failed = recent.filter(w => w.status === 'failed' || w.status === 'issues').length;
-  const avgElapsed = Math.round(recent.reduce((n, w) => n + Number(w.elapsedSeconds || 0), 0) / total);
-  return {
-    explicit,
-    generated: [
-      { scope: 'workflow', claim: `${passed}/${recent.length} recent waves passed cleanly.`, confidence: recent.length ? Math.min(0.9, 0.35 + recent.length / 50) : 0.2, evidence: { recentWaves: recent.length, passed, failed } },
-      { scope: 'task-size', claim: `Recent waves average ${formatDuration(avgElapsed)} max worker time; use this to decide whether task slices are too small or too large.`, confidence: recent.length ? 0.55 : 0.2, evidence: { avgElapsedSeconds: avgElapsed } },
-      { scope: 'prompt', claim: 'Make the active request explicit in .autopilot/request.md so every run can display what the user asked for.', confidence: 0.8, evidence: { source: 'dashboard gap' } },
-    ],
-  };
-}
-
-async function scanProject(host, repoPath) {
-  const repo = validateProject(host, repoPath);
-  if (!(await exists(repo))) throw Object.assign(new Error('repoPath does not exist'), { status: 404 });
-  const [git, waves, stateNames, logNames, request] = await Promise.all([
-    gitStatus(repo),
-    parseWaveSummaries(repo),
-    listFilesSafe(path.join(repo, 'state')),
-    listFilesSafe(path.join(repo, 'logs')),
-    firstExistingText(repo, REQUEST_FILES),
-  ]);
-  const latestWave = waves.at(-1) || null;
-  const stopState = {};
-  for (const name of STOP_FILES) stopState[name] = await exists(path.join(repo, 'state', name));
-  const runningPidFiles = stateNames.filter(n => n.endsWith('.pid'));
-  const loop = stageLoop(latestWave, stopState, runningPidFiles);
-  return {
-    key: projectKey(host, repo), host, repoPath: repo,
-    request,
-    git,
-    latestWave,
-    waveCount: waves.length,
-    recentWaves: waves.slice(-20).reverse(),
-    loop,
-    controls: { stopState, runningPidFiles },
-    logs: {
-      count: logNames.length,
-      latestSupervisorLog: latestByName(logNames.filter(n => n.includes('autopilot') && n.endsWith('.log'))),
-      latestWaveLog: latestByName(logNames.filter(n => n.includes('wave'))),
-    },
-    docs: await projectDocs(repo),
-    learnings: await projectLearnings(repo, waves),
-    settings: await settingsFor(host, repo),
-  };
-}
-
-function stageLoop(latestWave, stopState, pidFiles) {
-  const stopped = Object.values(stopState).some(Boolean);
-  const running = pidFiles.length > 0 && !stopped;
-  const stages = STAGES.map(stage => ({ stage, status: 'pending', summary: '' }));
-  if (!latestWave) {
-    stages[0].status = running ? 'running' : 'pending';
-    stages[0].summary = running ? 'Waiting for first wave summary.' : 'No wave summaries yet.';
-    return { current: running ? 'plan' : 'idle', stages };
-  }
-  stages[0].status = 'passed'; stages[0].summary = `Wave ${latestWave.id} selected work.`;
-  stages[1].status = 'passed'; stages[1].summary = `${latestWave.models.length} model(s): ${latestWave.models.map(m => String(m).split('/').at(-1)).join(', ')}`;
-  stages[2].status = 'passed'; stages[2].summary = `${latestWave.results.length} worker(s), max elapsed ${formatDuration(latestWave.elapsedSeconds)}.`;
-  stages[3].status = latestWave.issues.length ? 'failed' : 'passed'; stages[3].summary = latestWave.issues.length ? latestWave.issues.slice(0, 2).join('; ') : 'No issues recorded.';
-  stages[4].status = latestWave.verificationRc === 0 ? 'passed' : 'failed'; stages[4].summary = `${latestWave.mergedCount} branch(es) merged; tests rc=${latestWave.verificationRc}.`;
-  stages[5].status = 'passed'; stages[5].summary = `History recorded in ${latestWave.file}.`;
-  if (running) return { current: 'build', stages };
-  if (stopped) return { current: 'blocked', stages };
-  return { current: latestWave.status, stages };
-}
-function formatDuration(s) { s = Number(s || 0); const m = Math.floor(s / 60), sec = s % 60; return m ? `${m}m${sec}s` : `${sec}s`; }
-
-async function listRepoDir(host, repoPath, dir = '.') {
-  const repo = validateProject(host, repoPath);
-  const full = path.resolve(repo, dir);
-  if (!full.startsWith(repo)) throw Object.assign(new Error('path escapes repo'), { status: 400 });
-  const entries = await fs.readdir(full, { withFileTypes: true });
-  return entries
-    .filter(e => !['.git', 'node_modules', '.deps'].includes(e.name))
-    .map(e => ({ name: e.name, path: path.relative(repo, path.join(full, e.name)) || '.', type: e.isDirectory() ? 'dir' : 'file' }))
-    .sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1));
-}
-async function readRepoFile(host, repoPath, file) {
-  const repo = validateProject(host, repoPath);
-  const full = path.resolve(repo, file || 'README.md');
-  if (!full.startsWith(repo)) throw Object.assign(new Error('path escapes repo'), { status: 400 });
-  const stat = await fs.stat(full);
-  if (stat.isDirectory()) throw Object.assign(new Error('path is a directory'), { status: 400 });
-  if (stat.size > MAX_FILE_BYTES) throw Object.assign(new Error('file too large for preview'), { status: 413 });
-  return await fs.readFile(full, 'utf8');
-}
-
-async function controlProject(host, repoPath, action) {
-  const repo = validateProject(host, repoPath);
-  const state = path.join(repo, 'state');
-  await fs.mkdir(state, { recursive: true });
-  const touched = [];
-  if (action === 'stop-now' || action === 'pause') {
-    for (const name of ['STOP_AUTOPILOT', 'STOP_ETL_AUTOPILOT', 'STOP_ETL_PARALLEL']) { await fs.writeFile(path.join(state, name), new Date().toISOString() + '\n'); touched.push(name); }
-  } else if (action === 'stop-after-current-wave') {
-    for (const name of ['STOP_AFTER_CURRENT_LOOP']) { await fs.writeFile(path.join(state, name), new Date().toISOString() + '\n'); touched.push(name); }
-  } else if (action === 'resume') {
-    for (const name of STOP_FILES) { await fs.rm(path.join(state, name), { force: true }); touched.push(`removed:${name}`); }
+async function stepLoop(host, repoPath) {
+  const repo = validateProject(host, repoPath); const key = projectKey(host, repo); const loop = normalizedLoop(await loadState(), key);
+  if (!loop.intent.trim()) throw Object.assign(new Error('Set an intent before running the loop.'), { status: 400 });
+  const history = [...(loop.history || [])];
+  if (loop.stage === 'request') {
+    loop.oneShot = { ts: now(), intent: loop.intent, model: loop.model, acceptanceCriteria: acceptanceCriteria(loop.intent), overseerPrompt: loop.overseerPrompt, supervisorPrompt: loop.supervisorPrompt };
+    loop.stage = 'overseer'; loop.status = 'running'; history.push({ ts: now(), event: 'request-captured', criteria: loop.oneShot.acceptanceCriteria });
+  } else if (loop.stage === 'overseer') {
+    loop.variants = makeVariants(loop); loop.stage = 'supervisors'; history.push({ ts: now(), event: 'overseer-spawned-supervisors', variants: loop.variants.map(v => v.id) });
+  } else if (loop.stage === 'supervisors') {
+    loop.variants = (loop.variants.length ? loop.variants : makeVariants(loop)).map(v => ({ ...v, resultSummary: `${v.strategy} prepared a supervision plan and sub-agent team.` }));
+    loop.stage = 'subagents'; history.push({ ts: now(), event: 'supervisors-prepared-subagents', supervisorCount: loop.variants.length, subAgentCount: loop.variants.reduce((n, v) => n + (v.subAgents?.length || 0), 0) });
+  } else if (loop.stage === 'subagents') {
+    loop.variants = (loop.variants.length ? loop.variants : makeVariants(loop)).map(v => ({ ...v, resultSummary: `${v.strategy} managed its sub-agents and produced a candidate one-shot result.` }));
+    loop.stage = 'evaluate'; history.push({ ts: now(), event: 'subagents-ran', supervisorCount: loop.variants.length, subAgentCount: loop.variants.reduce((n, v) => n + (v.subAgents?.length || 0), 0) });
+  } else if (loop.stage === 'evaluate') {
+    const ev = evaluateVariants(loop); loop.variants = ev.variants; loop.score = ev.score; loop.supervisorScore = ev.supervisorScore; loop.subAgentScore = ev.subAgentScore; loop.metrics = ev.metrics; loop.evaluations = [...(loop.evaluations || []), ev].slice(-50); loop.stage = 'improve'; history.push({ ts: now(), event: 'evaluated', bestVariant: ev.bestVariant, score: ev.score, metrics: ev.metrics, usage: ev.usage, supervisorScore: ev.supervisorScore, subAgentScore: ev.subAgentScore, gaps: ev.gaps });
   } else {
-    throw Object.assign(new Error('unknown action'), { status: 400 });
+    const ev = loop.evaluations.at(-1); const before = loop.supervisorPrompt; loop.supervisorPrompt = revisePrompt(loop, ev); loop.cycle += 1;
+    const changed = before !== loop.supervisorPrompt; if (changed) loop.promptRevisions = [...(loop.promptRevisions || []), { ts: now(), cycle: loop.cycle, fromScore: loop.score, reason: ev?.gaps?.[0] || 'Improve one-shot reliability.' }].slice(-50);
+    loop.learnings = [...(loop.learnings || []), { ts: now(), cycle: loop.cycle, claim: ev?.summary || 'Compare one-shot variants to improve supervisor behavior.', score: loop.score }].slice(-50);
+    loop.stage = 'request'; history.push({ ts: now(), event: 'prompt-improved', changed, cycle: loop.cycle });
   }
-  return { ok: true, action, touched };
+  loop.history = history.slice(-100); loop.updatedAt = now(); return saveProjectState(key, loop);
 }
-
+async function scanProject(host, repoPath) { const repo = validateProject(host, repoPath); if (!(await exists(repo))) throw Object.assign(new Error('repoPath does not exist'), { status: 404 }); const key = projectKey(host, repo); const state = normalizedLoop(await loadState(), key); return { key, host, repoPath: repo, git: await gitStatus(repo), loop: state, stages: loopCards(state) }; }
+async function listRepoDir(host, repoPath, dir = '.') { const repo = validateProject(host, repoPath); const full = path.resolve(repo, dir); if (!full.startsWith(repo)) throw Object.assign(new Error('path escapes repo'), { status: 400 }); const entries = await fs.readdir(full, { withFileTypes: true }); return entries.filter(e => !['.git', 'node_modules'].includes(e.name)).map(e => ({ name: e.name, path: path.relative(repo, path.join(full, e.name)) || '.', type: e.isDirectory() ? 'dir' : 'file' })).sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1)); }
+async function readRepoFile(host, repoPath, file) { const repo = validateProject(host, repoPath); const full = path.resolve(repo, file || 'README.md'); if (!full.startsWith(repo)) throw Object.assign(new Error('path escapes repo'), { status: 400 }); const stat = await fs.stat(full); if (stat.isDirectory()) throw Object.assign(new Error('path is a directory'), { status: 400 }); if (stat.size > MAX_FILE_BYTES) throw Object.assign(new Error('file too large for preview'), { status: 413 }); return fs.readFile(full, 'utf8'); }
+async function readBody(req) { return new Promise((resolve, reject) => { let raw = ''; req.on('data', d => raw += d); req.on('end', () => { try { resolve(raw ? JSON.parse(raw) : {}); } catch (e) { reject(e); } }); req.on('error', reject); }); }
 async function handleApi(req, res, url) {
-  if (url.pathname === '/api/health') return json(res, 200, { ok: true, host: HOSTNAME, version: '0.1.0' });
+  if (url.pathname === '/api/health') return json(res, 200, { ok: true, host: HOSTNAME, version: '0.3.0-supervisor-lab' });
   if (url.pathname === '/api/projects' && req.method === 'GET') return json(res, 200, { projects: await loadProjects() });
-  if (url.pathname === '/api/projects' && req.method === 'POST') {
-    const body = await readBody(req); const repoPath = validateProject(body.host || HOSTNAME, body.repoPath);
-    const projects = await loadProjects(); const item = { host: body.host || HOSTNAME, repoPath, name: body.name || path.basename(repoPath), key: projectKey(body.host || HOSTNAME, repoPath) };
-    const next = projects.filter(p => p.key !== item.key).concat(item); await writeJson(PROJECTS_FILE, { projects: next }); return json(res, 200, item);
-  }
+  if (url.pathname === '/api/projects' && req.method === 'POST') { const body = await readBody(req); const host = body.host || HOSTNAME; const repoPath = validateProject(host, body.repoPath); const projects = await loadProjects(); const item = { host, repoPath, name: body.name || path.basename(repoPath), key: projectKey(host, repoPath) }; await writeJson(PROJECTS_FILE, { projects: projects.filter(p => p.key !== item.key).concat(item) }); return json(res, 200, item); }
   if (url.pathname === '/api/project') return json(res, 200, await scanProject(url.searchParams.get('host'), url.searchParams.get('repoPath')));
+  if (url.pathname === '/api/config' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await configureLoop(body.host, body.repoPath, body)); }
+  if (url.pathname === '/api/step' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await stepLoop(body.host, body.repoPath)); }
   if (url.pathname === '/api/files') return json(res, 200, { entries: await listRepoDir(url.searchParams.get('host'), url.searchParams.get('repoPath'), url.searchParams.get('dir') || '.') });
-  if (url.pathname === '/api/file') return text(res, 200, await readRepoFile(url.searchParams.get('host'), url.searchParams.get('repoPath'), url.searchParams.get('file')), 'text/plain; charset=utf-8');
-  if (url.pathname === '/api/live') return json(res, 200, await liveProject(url.searchParams.get('host'), url.searchParams.get('repoPath')));
-  if (url.pathname === '/api/settings' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await saveSettings(body.host, body.repoPath, body.settings || {})); }
-  if (url.pathname === '/api/start' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await startProject(body.host, body.repoPath, body)); }
-  if (url.pathname === '/api/control' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await controlProject(body.host, body.repoPath, body.action)); }
+  if (url.pathname === '/api/file') return text(res, 200, await readRepoFile(url.searchParams.get('host'), url.searchParams.get('repoPath'), url.searchParams.get('file')));
   return json(res, 404, { error: 'not found' });
 }
-function readBody(req) { return new Promise((resolve, reject) => { let raw = ''; req.on('data', d => raw += d); req.on('end', () => { try { resolve(raw ? JSON.parse(raw) : {}); } catch (e) { reject(e); } }); req.on('error', reject); }); }
-
-async function serveStatic(req, res, url) {
-  if (url.pathname === '/favicon.ico') {
-    res.writeHead(204, { 'cache-control': 'public, max-age=86400' });
-    return res.end();
-  }
-  let file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
-  const full = path.resolve(ROOT, 'public', file);
-  if (!full.startsWith(path.resolve(ROOT, 'public'))) return text(res, 403, 'forbidden');
-  if (!fssync.existsSync(full)) return text(res, 404, 'not found');
-  const ext = path.extname(full);
-  const type = ext === '.html' ? 'text/html; charset=utf-8' : ext === '.css' ? 'text/css; charset=utf-8' : ext === '.js' ? 'application/javascript; charset=utf-8' : 'application/octet-stream';
-  text(res, 200, await fs.readFile(full, ext === '.png' ? undefined : 'utf8'), type);
-}
-
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  try {
-    if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
-    return await serveStatic(req, res, url);
-  } catch (e) {
-    json(res, e.status || 500, { error: e.message || String(e) });
-  }
-});
+async function serveStatic(req, res, url) { if (url.pathname === '/favicon.ico') { res.writeHead(204); return res.end(); } const file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1); const full = path.resolve(ROOT, 'public', file); if (!full.startsWith(path.resolve(ROOT, 'public'))) return text(res, 403, 'forbidden'); if (!fssync.existsSync(full)) return text(res, 404, 'not found'); const ext = path.extname(full); const type = ext === '.html' ? 'text/html; charset=utf-8' : ext === '.css' ? 'text/css; charset=utf-8' : ext === '.js' ? 'application/javascript; charset=utf-8' : 'application/octet-stream'; return text(res, 200, await fs.readFile(full, 'utf8'), type); }
+const server = http.createServer(async (req, res) => { const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`); try { if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url); return await serveStatic(req, res, url); } catch (e) { return json(res, e.status || 500, { error: e.message || String(e) }); } });
 server.listen(PORT, '0.0.0.0', () => console.log(`Autopilot Control Tower listening on :${PORT}`));
