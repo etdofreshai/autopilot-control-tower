@@ -27,7 +27,7 @@ test('health and projects endpoints', async (t) => {
   t.after(async () => { await stop(); });
   const health = await fetch(`http://127.0.0.1:${PORT}/api/health`).then(r => r.json());
   assert.equal(health.ok, true);
-  assert.match(health.version, /background-loop/);
+  assert.match(health.version, /real-loop/);
   const projects = await fetch(`http://127.0.0.1:${PORT}/api/projects`).then(r => r.json());
   assert.ok(Array.isArray(projects.projects));
 });
@@ -46,91 +46,31 @@ test('missing project can be created from the API', async (t) => {
   assert.equal(created.git.branch, 'master');
 });
 
-test('configuring and stepping the supervisor learning loop', async (t) => {
-  await start();
+test('background loop launches real OpenClaw agents only', async (t) => {
+  const binDir = await mkdtemp(path.join(tmpdir(), 'act-bin-'));
+  t.after(() => rm(binDir, { recursive: true, force: true }));
+  const fake = path.join(binDir, 'fake-openclaw');
+  await writeFile(fake, '#!/usr/bin/env node\nsetTimeout(() => console.log(JSON.stringify({ reply: "FAKE_LOOP_OK" })), 25);\n', 'utf8');
+  await chmod(fake, 0o755);
+  await start({ AUTOPILOT_LOOP_TICK_MS: '100', OPENCLAW_BIN: fake, OPENCLAW_AGENT_RUNS: '1', OPENCLAW_AGENT_TOKEN: 'test-token' });
   t.after(async () => { await stop(); });
   const projects = await fetch(`http://127.0.0.1:${PORT}/api/projects`).then(r => r.json());
   const p = projects.projects[0];
-  assert.ok(p, 'seed project exists');
-
-  const configured = await post('/api/config', {
-    host: p.host,
-    repoPath: p.repoPath,
-    intent: 'Use a supervisor prompt to complete user requests in one shot, delegate to sub-agents, compare variants, and improve the prompt.',
-    model: 'gpt-5.5',
-    variantCount: 3,
-  });
-  assert.equal(configured.model, 'gpt-5.5');
-  assert.equal(configured.variantCount, 3);
-  assert.match(configured.overseerPrompt, /Autopilot Overseer/);
-  assert.match(configured.supervisorPrompt, /Autopilot Supervisor/);
-
-  let loop = await post('/api/step', { host: p.host, repoPath: p.repoPath });
-  assert.equal(loop.stage, 'overseer');
-  assert.ok(loop.oneShot.acceptanceCriteria.length >= 3);
-
-  loop = await post('/api/step', { host: p.host, repoPath: p.repoPath });
-  assert.equal(loop.stage, 'supervisors');
-  assert.equal(loop.variants.length, 3);
-  assert.equal(loop.variants[0].subAgents.length, 3);
-
-  loop = await post('/api/step', { host: p.host, repoPath: p.repoPath });
-  assert.equal(loop.stage, 'subagents');
-  loop = await post('/api/step', { host: p.host, repoPath: p.repoPath });
-  assert.equal(loop.stage, 'evaluate');
-  loop = await post('/api/step', { host: p.host, repoPath: p.repoPath });
-  assert.equal(loop.stage, 'improve');
-  assert.ok(loop.score > 0);
-  assert.ok(loop.supervisorScore > 0);
-  assert.ok(loop.subAgentScore > 0);
-  assert.ok(loop.metrics.correctness > 0);
-  assert.ok(loop.metrics.duration > 0);
-});
-
-
-
-test('background simulated autopilot advances the loop', async (t) => {
-  await start({ AUTOPILOT_LOOP_TICK_MS: '100' });
-  t.after(async () => { await stop(); });
-  const projects = await fetch(`http://127.0.0.1:${PORT}/api/projects`).then(r => r.json());
-  const p = projects.projects[0];
-  await post('/api/config', { host: p.host, repoPath: p.repoPath, intent: 'Keep improving the supervisor prompt.', variantCount: 2 });
-  const enabled = await post('/api/autopilot', { host: p.host, repoPath: p.repoPath, enabled: true, runNow: true, mode: 'simulated', intervalSeconds: 10 });
+  await post('/api/config', { host: p.host, repoPath: p.repoPath, intent: 'Keep improving the project with real agents.', variantCount: 2 });
+  const enabled = await fetch(`http://127.0.0.1:${PORT}/api/autopilot`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-agent-token': 'test-token' }, body: JSON.stringify({ host: p.host, repoPath: p.repoPath, enabled: true, runNow: true, mode: 'simulated', intervalSeconds: 10 }) }).then(r => r.json());
   assert.equal(enabled.autopilot.enabled, true);
+  assert.equal(enabled.autopilot.mode, 'agent');
   for (let i = 0; i < 30; i++) {
     const snap = await fetch(`http://127.0.0.1:${PORT}/api/project?host=${encodeURIComponent(p.host)}&repoPath=${encodeURIComponent(p.repoPath)}`).then(r => r.json());
-    if (snap.loop.history.some(x => x.event === 'request-captured')) {
+    const run = snap.loop.agentRuns.find(x => /FAKE_LOOP_OK/.test(x.output || '')) || snap.loop.agentRuns[0];
+    if (run?.status === 'succeeded' && /FAKE_LOOP_OK/.test(run.output || '')) {
+      assert.match(run.output, /FAKE_LOOP_OK/);
       assert.equal(snap.loop.autopilot.enabled, true);
-      assert.equal(snap.loop.autopilot.mode, 'simulated');
+      assert.equal(snap.loop.autopilot.mode, 'agent');
       return;
     }
     await new Promise(r => setTimeout(r, 100));
   }
-  assert.fail('background autopilot did not advance the loop');
+  assert.fail('background real loop did not launch an agent');
 });
 
-test('real OpenClaw agent start records async run output', async (t) => {
-  const binDir = await mkdtemp(path.join(tmpdir(), 'act-bin-'));
-  t.after(() => rm(binDir, { recursive: true, force: true }));
-  const fake = path.join(binDir, 'fake-openclaw');
-  await writeFile(fake, '#!/usr/bin/env node\nconsole.log(JSON.stringify({ reply: "FAKE_AGENT_OK" }));\n', 'utf8');
-  await chmod(fake, 0o755);
-  await start({ OPENCLAW_BIN: fake, OPENCLAW_AGENT_RUNS: '1', OPENCLAW_AGENT_TOKEN: 'test-token' });
-  t.after(async () => { await stop(); });
-  const projects = await fetch(`http://127.0.0.1:${PORT}/api/projects`).then(r => r.json());
-  const p = projects.projects[0];
-  const configured = await post('/api/config', { host: p.host, repoPath: p.repoPath, intent: 'Fake agent smoke test', agentId: 'test-agent' });
-  assert.equal(configured.agentId, 'test-agent');
-  const run = await fetch(`http://127.0.0.1:${PORT}/api/agent/start`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-agent-token': 'test-token' }, body: JSON.stringify({ host: p.host, repoPath: p.repoPath }) }).then(r => r.json());
-  assert.equal(run.status, 'running');
-  for (let i = 0; i < 20; i++) {
-    const snap = await fetch(`http://127.0.0.1:${PORT}/api/project?host=${encodeURIComponent(p.host)}&repoPath=${encodeURIComponent(p.repoPath)}`).then(r => r.json());
-    const found = snap.loop.agentRuns.find(x => x.id === run.id);
-    if (found?.status === 'succeeded') {
-      assert.match(found.output, /FAKE_AGENT_OK/);
-      return;
-    }
-    await new Promise(r => setTimeout(r, 50));
-  }
-  assert.fail('agent run did not complete');
-});

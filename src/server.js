@@ -57,7 +57,7 @@ const AGENT_RUN_TOKEN = process.env.OPENCLAW_AGENT_TOKEN || '';
 const LOG_LEVEL = String(process.env.LOG_LEVEL || 'debug').toLowerCase();
 const LOG_LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 const LOG_MIN = LOG_LEVELS[LOG_LEVEL] || LOG_LEVELS.debug;
-const VERSION = '0.5.0-background-loop';
+const VERSION = '0.6.0-real-loop';
 const LOOP_TICK_MS = Math.max(1000, Number(process.env.AUTOPILOT_LOOP_TICK_MS || 5000));
 const MIN_LOOP_INTERVAL_SECONDS = 10;
 
@@ -135,15 +135,14 @@ function blankLoop() {
     promptRevisions: [],
     history: [],
     agentRuns: [],
-    autopilot: { enabled: false, mode: 'simulated', intervalSeconds: 300, lastTickAt: '', nextRunAt: '', lastError: '' },
+    autopilot: { enabled: false, mode: 'agent', intervalSeconds: 300, lastTickAt: '', nextRunAt: '', lastError: '' },
     updatedAt: now(),
   };
 }
 function normalizedLoop(all, key) { return { ...blankLoop(), ...(all.projects?.[key] || {}) }; }
 function normalizeAutopilot(value = {}) {
-  const mode = value.mode === 'agent' ? 'agent' : 'simulated';
   const intervalSeconds = Math.max(MIN_LOOP_INTERVAL_SECONDS, Number(value.intervalSeconds || 300));
-  return { enabled: Boolean(value.enabled), mode, intervalSeconds, lastTickAt: value.lastTickAt || '', nextRunAt: value.nextRunAt || '', lastError: value.lastError || '' };
+  return { enabled: Boolean(value.enabled), mode: 'agent', intervalSeconds, lastTickAt: value.lastTickAt || '', nextRunAt: value.nextRunAt || '', lastError: value.lastError || '' };
 }
 function dueAtFrom(intervalSeconds) { return new Date(Date.now() + Math.max(MIN_LOOP_INTERVAL_SECONDS, Number(intervalSeconds || 300)) * 1000).toISOString(); }
 
@@ -304,9 +303,8 @@ async function configureAutopilot(host, repoPath, patch = {}) {
   const repo = validateProject(host, repoPath); const key = projectKey(host, repo); const all = await loadState(); const loop = normalizedLoop(all, key);
   const current = normalizeAutopilot(loop.autopilot);
   const enabled = patch.enabled ?? current.enabled;
-  const mode = patch.mode || current.mode;
   const intervalSeconds = Math.max(MIN_LOOP_INTERVAL_SECONDS, Number(patch.intervalSeconds || current.intervalSeconds || 300));
-  loop.autopilot = { ...current, enabled: Boolean(enabled), mode: mode === 'agent' ? 'agent' : 'simulated', intervalSeconds, nextRunAt: Boolean(enabled) ? (patch.runNow ? now() : (current.nextRunAt || dueAtFrom(intervalSeconds))) : '', lastError: Boolean(enabled) ? current.lastError : '' };
+  loop.autopilot = { ...current, enabled: Boolean(enabled), mode: 'agent', intervalSeconds, nextRunAt: Boolean(enabled) ? (patch.runNow ? now() : (current.nextRunAt || dueAtFrom(intervalSeconds))) : '', lastError: Boolean(enabled) ? current.lastError : '' };
   loop.status = loop.autopilot.enabled ? `autopilot ${loop.autopilot.mode} loop enabled` : (loop.status || 'ready');
   loop.history = [...(loop.history || []), { ts: now(), event: loop.autopilot.enabled ? 'autopilot-enabled' : 'autopilot-disabled', autopilot: loop.autopilot }].slice(-100);
   loop.updatedAt = now(); all.projects[key] = loop; await writeJson(STATE_FILE, all);
@@ -333,8 +331,7 @@ async function runAutopilotTick(project) {
     loop.autopilot.lastTickAt = now(); loop.autopilot.nextRunAt = dueAtFrom(loop.autopilot.intervalSeconds); loop.autopilot.lastError = '';
     all.projects[key] = loop; await writeJson(STATE_FILE, all);
     log('info', 'autopilot.tick.start', { key, mode: loop.autopilot.mode, intervalSeconds: loop.autopilot.intervalSeconds });
-    if (loop.autopilot.mode === 'agent') await startAgentRun(project.host, repo, { message: loop.intent, agentId: loop.agentId });
-    else await stepLoop(project.host, repo);
+    await startAgentRun(project.host, repo, { message: loop.intent, agentId: loop.agentId });
     log('info', 'autopilot.tick.complete', { key, mode: loop.autopilot.mode });
   } catch (e) {
     logError('autopilot.tick.error', e, { key });
@@ -492,9 +489,7 @@ async function handleApi(req, res, url) {
   if (url.pathname === '/api/project') return json(res, 200, await scanProject(url.searchParams.get('host'), url.searchParams.get('repoPath')));
   if (url.pathname === '/api/project/create' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await createProjectRepo(body.host, body.repoPath, body.name)); }
   if (url.pathname === '/api/config' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await configureLoop(body.host, body.repoPath, body)); }
-  if (url.pathname === '/api/step' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await stepLoop(body.host, body.repoPath)); }
-  if (url.pathname === '/api/autopilot' && req.method === 'POST') { const body = await readBody(req); if ((body.mode || 'simulated') === 'agent' && body.enabled !== false) requireAgentAuth(req); return json(res, 200, await configureAutopilot(body.host, body.repoPath, body)); }
-  if (url.pathname === '/api/agent/start' && req.method === 'POST') { requireAgentAuth(req); const body = await readBody(req); return json(res, 200, await startAgentRun(body.host, body.repoPath, body)); }
+  if (url.pathname === '/api/autopilot' && req.method === 'POST') { const body = await readBody(req); if (body.enabled !== false) requireAgentAuth(req); return json(res, 200, await configureAutopilot(body.host, body.repoPath, { ...body, mode: 'agent' })); }
   if (url.pathname === '/api/agent/log') return text(res, 200, await getAgentRunLog(url.searchParams.get('id')));
   if (url.pathname === '/api/client-log' && req.method === 'POST') { const body = await readBody(req); log(body.level === 'error' ? 'warn' : 'info', 'client.event', { requestId: req.requestId, client: body }); return json(res, 200, { ok: true }); }
   if (url.pathname === '/api/files') return json(res, 200, { entries: await listRepoDir(url.searchParams.get('host'), url.searchParams.get('repoPath'), url.searchParams.get('dir') || '.') });
