@@ -57,6 +57,9 @@ const AGENT_RUN_TOKEN = process.env.OPENCLAW_AGENT_TOKEN || '';
 const LOG_LEVEL = String(process.env.LOG_LEVEL || 'debug').toLowerCase();
 const LOG_LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 const LOG_MIN = LOG_LEVELS[LOG_LEVEL] || LOG_LEVELS.debug;
+const VERSION = '0.5.0-background-loop';
+const LOOP_TICK_MS = Math.max(1000, Number(process.env.AUTOPILOT_LOOP_TICK_MS || 5000));
+const MIN_LOOP_INTERVAL_SECONDS = 10;
 
 const DEFAULT_OVERSEER_PROMPT = `You are Autopilot Overseer. Keep your role simple and stable: receive the user request, spawn a small set of supervisor variants, assign each supervisor the same intent, and compare their final results. Do not do the project work yourself.`;
 
@@ -132,10 +135,17 @@ function blankLoop() {
     promptRevisions: [],
     history: [],
     agentRuns: [],
+    autopilot: { enabled: false, mode: 'simulated', intervalSeconds: 300, lastTickAt: '', nextRunAt: '', lastError: '' },
     updatedAt: now(),
   };
 }
 function normalizedLoop(all, key) { return { ...blankLoop(), ...(all.projects?.[key] || {}) }; }
+function normalizeAutopilot(value = {}) {
+  const mode = value.mode === 'agent' ? 'agent' : 'simulated';
+  const intervalSeconds = Math.max(MIN_LOOP_INTERVAL_SECONDS, Number(value.intervalSeconds || 300));
+  return { enabled: Boolean(value.enabled), mode, intervalSeconds, lastTickAt: value.lastTickAt || '', nextRunAt: value.nextRunAt || '', lastError: value.lastError || '' };
+}
+function dueAtFrom(intervalSeconds) { return new Date(Date.now() + Math.max(MIN_LOOP_INTERVAL_SECONDS, Number(intervalSeconds || 300)) * 1000).toISOString(); }
 
 function runGit(repo, args, timeoutMs = 4000) {
   return new Promise(resolve => {
@@ -286,6 +296,61 @@ async function startAgentRun(host, repoPath, body = {}) {
   });
   return entry;
 }
+
+function isAgentRunActive(loop) {
+  return (loop.agentRuns || []).some(r => r.status === 'running');
+}
+async function configureAutopilot(host, repoPath, patch = {}) {
+  const repo = validateProject(host, repoPath); const key = projectKey(host, repo); const all = await loadState(); const loop = normalizedLoop(all, key);
+  const current = normalizeAutopilot(loop.autopilot);
+  const enabled = patch.enabled ?? current.enabled;
+  const mode = patch.mode || current.mode;
+  const intervalSeconds = Math.max(MIN_LOOP_INTERVAL_SECONDS, Number(patch.intervalSeconds || current.intervalSeconds || 300));
+  loop.autopilot = { ...current, enabled: Boolean(enabled), mode: mode === 'agent' ? 'agent' : 'simulated', intervalSeconds, nextRunAt: Boolean(enabled) ? (patch.runNow ? now() : (current.nextRunAt || dueAtFrom(intervalSeconds))) : '', lastError: Boolean(enabled) ? current.lastError : '' };
+  loop.status = loop.autopilot.enabled ? `autopilot ${loop.autopilot.mode} loop enabled` : (loop.status || 'ready');
+  loop.history = [...(loop.history || []), { ts: now(), event: loop.autopilot.enabled ? 'autopilot-enabled' : 'autopilot-disabled', autopilot: loop.autopilot }].slice(-100);
+  loop.updatedAt = now(); all.projects[key] = loop; await writeJson(STATE_FILE, all);
+  log('info', 'autopilot.configure', { host, repoPath: repo, autopilot: loop.autopilot });
+  return loop;
+}
+const activeLoopTicks = new Set();
+async function runAutopilotTick(project) {
+  const repo = validateProject(project.host, project.repoPath); const key = projectKey(project.host, repo);
+  if (activeLoopTicks.has(key)) return;
+  activeLoopTicks.add(key);
+  try {
+    const all = await loadState(); const loop = normalizedLoop(all, key); loop.autopilot = normalizeAutopilot(loop.autopilot);
+    if (!loop.autopilot.enabled) return;
+    const nextMs = loop.autopilot.nextRunAt ? Date.parse(loop.autopilot.nextRunAt) : 0;
+    if (nextMs && nextMs > Date.now()) return;
+    if (isAgentRunActive(loop)) {
+      loop.autopilot.nextRunAt = dueAtFrom(Math.min(60, loop.autopilot.intervalSeconds));
+      loop.autopilot.lastError = '';
+      all.projects[key] = loop; await writeJson(STATE_FILE, all);
+      return;
+    }
+    if (!loop.intent.trim()) throw new Error('Set an intent before running the autopilot loop.');
+    loop.autopilot.lastTickAt = now(); loop.autopilot.nextRunAt = dueAtFrom(loop.autopilot.intervalSeconds); loop.autopilot.lastError = '';
+    all.projects[key] = loop; await writeJson(STATE_FILE, all);
+    log('info', 'autopilot.tick.start', { key, mode: loop.autopilot.mode, intervalSeconds: loop.autopilot.intervalSeconds });
+    if (loop.autopilot.mode === 'agent') await startAgentRun(project.host, repo, { message: loop.intent, agentId: loop.agentId });
+    else await stepLoop(project.host, repo);
+    log('info', 'autopilot.tick.complete', { key, mode: loop.autopilot.mode });
+  } catch (e) {
+    logError('autopilot.tick.error', e, { key });
+    const all = await loadState(); const loop = normalizedLoop(all, key); loop.autopilot = normalizeAutopilot(loop.autopilot);
+    loop.autopilot.lastTickAt = now(); loop.autopilot.nextRunAt = dueAtFrom(loop.autopilot.intervalSeconds); loop.autopilot.lastError = e.message || String(e);
+    loop.status = 'autopilot error'; loop.history = [...(loop.history || []), { ts: now(), event: 'autopilot-error', error: loop.autopilot.lastError }].slice(-100);
+    all.projects[key] = loop; await writeJson(STATE_FILE, all);
+  } finally { activeLoopTicks.delete(key); }
+}
+async function tickAutopilots() {
+  try {
+    const projects = await loadProjects();
+    await Promise.all(projects.map(p => runAutopilotTick(p)));
+  } catch (e) { logError('autopilot.scheduler.error', e); }
+}
+
 async function getAgentRunLog(id) {
   const safe = String(id || '').replace(/[^a-z0-9-]/gi, '');
   if (!safe) throw Object.assign(new Error('id required'), { status: 400 });
@@ -421,13 +486,14 @@ async function listRepoDir(host, repoPath, dir = '.') { const repo = validatePro
 async function readRepoFile(host, repoPath, file) { const repo = validateProject(host, repoPath); const full = path.resolve(repo, file || 'README.md'); if (!full.startsWith(repo)) throw Object.assign(new Error('path escapes repo'), { status: 400 }); const stat = await fs.stat(full); if (stat.isDirectory()) throw Object.assign(new Error('path is a directory'), { status: 400 }); if (stat.size > MAX_FILE_BYTES) throw Object.assign(new Error('file too large for preview'), { status: 413 }); return fs.readFile(full, 'utf8'); }
 async function readBody(req) { return new Promise((resolve, reject) => { let raw = ''; req.on('data', d => raw += d); req.on('end', () => { try { const parsed = raw ? JSON.parse(raw) : {}; log('debug', 'request.body.parsed', { requestId: req.requestId, bytes: raw.length, body: parsed }); resolve(parsed); } catch (e) { logError('request.body.parse_failed', e, { requestId: req.requestId, bytes: raw.length, preview: raw.slice(0, 500) }); reject(e); } }); req.on('error', reject); }); }
 async function handleApi(req, res, url) {
-  if (url.pathname === '/api/health') return json(res, 200, { ok: true, host: HOSTNAME, projectHost: DEFAULT_PROJECT_HOST, dataDir: DATA_DIR, version: '0.4.1-persistent-projects', agentRunsEnabled: AGENT_RUNS_ENABLED, agentRunsAuth: Boolean(AGENT_RUN_TOKEN) });
+  if (url.pathname === '/api/health') return json(res, 200, { ok: true, host: HOSTNAME, projectHost: DEFAULT_PROJECT_HOST, dataDir: DATA_DIR, version: VERSION, agentRunsEnabled: AGENT_RUNS_ENABLED, agentRunsAuth: Boolean(AGENT_RUN_TOKEN), loopTickMs: LOOP_TICK_MS });
   if (url.pathname === '/api/projects' && req.method === 'GET') return json(res, 200, { projects: await loadProjects() });
   if (url.pathname === '/api/projects' && req.method === 'POST') { const body = await readBody(req); const host = body.host || DEFAULT_PROJECT_HOST; const repoPath = validateProject(host, body.repoPath); const projects = await loadProjects(); const item = { host, repoPath, name: body.name || path.basename(repoPath), key: projectKey(host, repoPath) }; await writeJson(PROJECTS_FILE, { projects: projects.filter(p => p.key !== item.key).concat(item) }); return json(res, 200, item); }
   if (url.pathname === '/api/project') return json(res, 200, await scanProject(url.searchParams.get('host'), url.searchParams.get('repoPath')));
   if (url.pathname === '/api/project/create' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await createProjectRepo(body.host, body.repoPath, body.name)); }
   if (url.pathname === '/api/config' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await configureLoop(body.host, body.repoPath, body)); }
   if (url.pathname === '/api/step' && req.method === 'POST') { const body = await readBody(req); return json(res, 200, await stepLoop(body.host, body.repoPath)); }
+  if (url.pathname === '/api/autopilot' && req.method === 'POST') { const body = await readBody(req); if ((body.mode || 'simulated') === 'agent' && body.enabled !== false) requireAgentAuth(req); return json(res, 200, await configureAutopilot(body.host, body.repoPath, body)); }
   if (url.pathname === '/api/agent/start' && req.method === 'POST') { requireAgentAuth(req); const body = await readBody(req); return json(res, 200, await startAgentRun(body.host, body.repoPath, body)); }
   if (url.pathname === '/api/agent/log') return text(res, 200, await getAgentRunLog(url.searchParams.get('id')));
   if (url.pathname === '/api/client-log' && req.method === 'POST') { const body = await readBody(req); log(body.level === 'error' ? 'warn' : 'info', 'client.event', { requestId: req.requestId, client: body }); return json(res, 200, { ok: true }); }
@@ -455,5 +521,8 @@ const server = http.createServer(async (req, res) => {
 });
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Autopilot Control Tower listening on :${PORT}`);
-  log('info', 'server.started', { port: PORT, version: '0.4.1-persistent-projects', dataDir: DATA_DIR, defaultProjectHost: DEFAULT_PROJECT_HOST, agentRunsEnabled: AGENT_RUNS_ENABLED, agentRunsAuth: Boolean(AGENT_RUN_TOKEN), logLevel: LOG_LEVEL });
+  log('info', 'server.started', { port: PORT, version: VERSION, dataDir: DATA_DIR, defaultProjectHost: DEFAULT_PROJECT_HOST, agentRunsEnabled: AGENT_RUNS_ENABLED, agentRunsAuth: Boolean(AGENT_RUN_TOKEN), logLevel: LOG_LEVEL, loopTickMs: LOOP_TICK_MS });
 });
+
+setInterval(tickAutopilots, LOOP_TICK_MS).unref();
+setTimeout(tickAutopilots, 1000).unref();

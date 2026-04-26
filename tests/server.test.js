@@ -27,7 +27,7 @@ test('health and projects endpoints', async (t) => {
   t.after(async () => { await stop(); });
   const health = await fetch(`http://127.0.0.1:${PORT}/api/health`).then(r => r.json());
   assert.equal(health.ok, true);
-  assert.match(health.version, /persistent-projects/);
+  assert.match(health.version, /background-loop/);
   const projects = await fetch(`http://127.0.0.1:${PORT}/api/projects`).then(r => r.json());
   assert.ok(Array.isArray(projects.projects));
 });
@@ -87,6 +87,27 @@ test('configuring and stepping the supervisor learning loop', async (t) => {
   assert.ok(loop.metrics.duration > 0);
 });
 
+
+
+test('background simulated autopilot advances the loop', async (t) => {
+  await start({ AUTOPILOT_LOOP_TICK_MS: '100' });
+  t.after(async () => { await stop(); });
+  const projects = await fetch(`http://127.0.0.1:${PORT}/api/projects`).then(r => r.json());
+  const p = projects.projects[0];
+  await post('/api/config', { host: p.host, repoPath: p.repoPath, intent: 'Keep improving the supervisor prompt.', variantCount: 2 });
+  const enabled = await post('/api/autopilot', { host: p.host, repoPath: p.repoPath, enabled: true, runNow: true, mode: 'simulated', intervalSeconds: 10 });
+  assert.equal(enabled.autopilot.enabled, true);
+  for (let i = 0; i < 30; i++) {
+    const snap = await fetch(`http://127.0.0.1:${PORT}/api/project?host=${encodeURIComponent(p.host)}&repoPath=${encodeURIComponent(p.repoPath)}`).then(r => r.json());
+    if (snap.loop.history.some(x => x.event === 'request-captured')) {
+      assert.equal(snap.loop.autopilot.enabled, true);
+      assert.equal(snap.loop.autopilot.mode, 'simulated');
+      return;
+    }
+    await new Promise(r => setTimeout(r, 100));
+  }
+  assert.fail('background autopilot did not advance the loop');
+});
 
 test('real OpenClaw agent start records async run output', async (t) => {
   const binDir = await mkdtemp(path.join(tmpdir(), 'act-bin-'));

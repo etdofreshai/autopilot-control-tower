@@ -90,6 +90,8 @@ function renderDashboard() {
       </div>
       <div class="toolbar">
         <button data-start-agent>Start real OpenClaw agent</button>
+        <button data-start-loop>Start background loop</button>
+        <button data-stop-loop>Stop loop</button>
         <button data-step>Run simulated loop step</button>
       </div>
     </section>
@@ -97,6 +99,8 @@ function renderDashboard() {
     <div id="tabBody">${renderTab()}</div>`;
   document.querySelector('[data-step]').onclick = runStep;
   document.querySelector('[data-start-agent]').onclick = startAgent;
+  document.querySelector('[data-start-loop]').onclick = startBackgroundLoop;
+  document.querySelector('[data-stop-loop]').onclick = stopBackgroundLoop;
   document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => setTab(b.dataset.tab));
   const f = $('#intentForm'); if (f) f.onsubmit = saveConfig;
   if (state.tab === 'files') loadBrowser();
@@ -142,6 +146,7 @@ function renderLoop() {
       <div class="metric"><b>${esc(l.model)}</b><span>supervisor model</span></div>
       <div class="metric"><b class="${scoreClass(l.score)}">${l.score}</b><span>weighted overall / 100</span></div>
       <div class="metric"><b>${l.metrics?.correctness || 0}</b><span>correctness / 100</span></div>
+      <div class="metric"><b>${l.autopilot?.enabled ? 'on' : 'off'}</b><span>background loop</span></div>
     </section>
     <section class="card">
       <h2>Inputs</h2>
@@ -152,9 +157,12 @@ function renderLoop() {
         <label>Model<input name="model" placeholder="gpt-5.5, opus, GLM..." value="${esc(l.model)}"></label>
         <label>A/B variants<input name="variantCount" type="number" min="1" max="6" value="${esc(l.variantCount || 3)}"></label>
         <label>OpenClaw agent id<input name="agentId" placeholder="blank = default agent" value="${esc(l.agentId || '')}"></label>
-        <div class="toolbar align-end"><button>Save lab setup</button><button type="button" onclick="startAgent()">Start real agent</button><button type="button" onclick="runStep()">Run simulated step</button></div>
+        <label>Loop mode<select name="loopMode"><option value="simulated" ${l.autopilot?.mode !== 'agent' ? 'selected' : ''}>Simulated steps</option><option value="agent" ${l.autopilot?.mode === 'agent' ? 'selected' : ''}>Real OpenClaw agents</option></select></label>
+        <label>Loop interval seconds<input name="loopIntervalSeconds" type="number" min="10" value="${esc(l.autopilot?.intervalSeconds || 300)}"></label>
+        <div class="toolbar align-end"><button>Save lab setup</button><button type="button" onclick="startAgent()">Start real agent</button><button type="button" onclick="startBackgroundLoop()">Start loop</button><button type="button" onclick="stopBackgroundLoop()">Stop loop</button><button type="button" onclick="runStep()">Run simulated step</button></div>
       </form>
     </section>
+    <section class="card"><h2>Background loop</h2>${autopilotStatus(l.autopilot)}</section>
     <section class="card"><h2>Visible loop</h2><div class="loop">${s.stages.map(stageCard).join('')}</div></section>
     <section class="card"><h2>Real OpenClaw agent runs</h2>${agentRuns(l.agentRuns)}</section>
     <section class="split">
@@ -163,6 +171,12 @@ function renderLoop() {
     </section>
     <section class="card"><h2>Repo status</h2><p class="mono muted">${esc(s.git.branch)} @ ${esc(s.git.head)} · ${s.git.dirtyFiles ?? '?'} dirty file(s)</p>${(s.git.recentCommits||[]).map(c=>`<div class="mono">${esc(c)}</div>`).join('')}</section>`;
 }
+
+function autopilotStatus(a={}) {
+  const cls = a.enabled ? 'good' : 'warn';
+  return `<p><span class="pill ${cls}">${a.enabled ? 'enabled' : 'disabled'}</span> <strong>${esc(a.mode || 'simulated')}</strong> every ${esc(a.intervalSeconds || 300)}s</p><p class="muted mono">last tick: ${esc(a.lastTickAt || 'never')} · next run: ${esc(a.nextRunAt || 'not scheduled')}</p>${a.lastError ? `<pre class="mini-pre bad">${esc(a.lastError)}</pre>` : ''}`;
+}
+
 function stageCard(x) { return `<div class="stage ${esc(x.status)}"><h3>${esc(x.stage)}</h3><span class="pill">${esc(x.status)}</span><p>${esc(x.summary)}</p></div>`; }
 function criteriaList(items=[]) {
   if (!items?.length) return '<p class="muted">Run the request step to derive acceptance criteria.</p>';
@@ -193,6 +207,32 @@ async function saveConfig(e) {
   await refreshCurrent();
   clientLog('ui.config.save.complete', { current: state.current });
 }
+
+async function startBackgroundLoop() {
+  const p = currentProject();
+  const f = $('#intentForm');
+  const fd = f ? new FormData(f) : new FormData();
+  const mode = fd.get('loopMode') || state.snapshot.loop.autopilot?.mode || 'simulated';
+  const headers = {'content-type':'application/json'};
+  if (mode === 'agent') {
+    const token = localStorage.getItem('openclawAgentToken') || prompt('OpenClaw agent launch token');
+    if (!token) return;
+    localStorage.setItem('openclawAgentToken', token);
+    headers['x-agent-token'] = token;
+  }
+  try {
+    await api('/api/autopilot', { method:'POST', headers, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, enabled:true, runNow:true, mode, intervalSeconds: fd.get('loopIntervalSeconds') || 300 }) });
+    await refreshCurrent();
+  } catch (e) { alert(e.message); }
+}
+async function stopBackgroundLoop() {
+  const p = currentProject();
+  try {
+    await api('/api/autopilot', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ host:p.host, repoPath:p.repoPath, enabled:false }) });
+    await refreshCurrent();
+  } catch (e) { alert(e.message); }
+}
+
 async function startAgent() {
   const p = currentProject();
   clientLog('ui.agent.start.clicked', { project: p?.key });

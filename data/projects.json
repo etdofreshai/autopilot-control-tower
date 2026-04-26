@@ -23,6 +23,12 @@
       "repoPath": "/openclaw/.openclaw/tmp/autopilot-control-tower",
       "name": "Autopilot Control Tower workspace",
       "key": "233b25d7bf4b:/openclaw/.openclaw/tmp/autopilot-control-tower"
+    },
+    {
+      "host": "dokploy",
+      "repoPath": "/openclaw/.openclaw/tmp/md-to-html-preview",
+      "name": "Markdown to HTML converter",
+      "key": "dokploy:/openclaw/.openclaw/tmp/md-to-html-preview"
     }
   ]
 }
