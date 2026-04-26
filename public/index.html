@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Autopilot Control Tower</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">OpenClaw</p>
+      <h1>Autopilot Control Tower</h1>
+      <p class="sub">PLAN → ASSIGN → BUILD → REVIEW → INTEGRATE → LEARN</p>
+    </div>
+    <div class="header-actions">
+      <button id="refresh">Refresh</button>
+      <span id="health" class="pill">connecting…</span>
+    </div>
+  </header>
+
+  <main>
+    <aside>
+      <h2>Projects</h2>
+      <div id="projects" class="stack"></div>
+      <form id="addProject" class="card compact">
+        <strong>Add local project</strong>
+        <input name="name" placeholder="Name" />
+        <input name="repoPath" placeholder="/absolute/path/to/repo" required />
+        <button>Add</button>
+      </form>
+    </aside>
+
+    <section id="dashboard" class="stack grow">
+      <div class="empty">Choose a project.</div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
