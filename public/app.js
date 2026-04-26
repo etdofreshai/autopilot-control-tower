@@ -19,7 +19,14 @@ async function init() {
   $('#addProject').onsubmit = addProject;
   const preferred = state.projects.find(p => p.repoPath.includes('etl-scripting-language')) || state.projects.find(p => p.host === 'dokploy' && p.repoPath === '/app') || state.projects[0];
   if (preferred) selectProject(preferred.key);
-  setInterval(refreshCurrent, 15000);
+  setInterval(autoRefreshCurrent, 15000);
+}
+async function autoRefreshCurrent() {
+  // Do not tear down the DOM while someone is reading a wave, editing settings,
+  // or browsing files. Manual Refresh still works everywhere.
+  if (!['overview', 'live'].includes(state.tab)) return;
+  if (state.tab === 'live') return loadLive();
+  return refreshCurrent();
 }
 async function loadProjects() {
   const data = await api('/api/projects'); state.projects = data.projects || [];
