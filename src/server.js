@@ -133,6 +133,17 @@ function makeVariants(loop) {
 }
 function runId() { return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`; }
 function shortText(s, max = 2400) { s = String(s || ''); return s.length > max ? s.slice(0, max) + `\n…truncated (${s.length} chars)` : s; }
+function parseOpenClawJson(out) {
+  try { return JSON.parse(out); } catch {}
+  for (let i = out.lastIndexOf('{'); i >= 0; i = out.lastIndexOf('{', i - 1)) {
+    const candidate = out.slice(i).trim();
+    try { return JSON.parse(candidate); } catch {}
+  }
+  return null;
+}
+function openClawReply(parsed, out) {
+  return parsed?.reply || parsed?.text || parsed?.message || parsed?.result || parsed?.finalAssistantVisibleText || parsed?.data?.finalAssistantVisibleText || parsed?.turn?.finalAssistantVisibleText || out;
+}
 async function appendRunLog(id, chunk) { await fs.mkdir(AGENT_RUNS_DIR, { recursive: true }); await fs.appendFile(path.join(AGENT_RUNS_DIR, `${id}.log`), chunk); }
 async function updateAgentRun(projectKeyValue, id, patch) {
   const all = await loadState();
@@ -188,9 +199,8 @@ async function startAgentRun(host, repoPath, body = {}) {
   child.stderr.on('data', d => { err += d; appendRunLog(id, d).catch(()=>{}); });
   child.on('error', e => updateAgentRun(key, id, { status: 'failed', error: String(e), completedAt: now() }).catch(()=>{}));
   child.on('close', rc => {
-    let parsed = null;
-    try { parsed = JSON.parse(out); } catch {}
-    const reply = parsed?.reply || parsed?.text || parsed?.message || parsed?.result || out;
+    const parsed = parseOpenClawJson(out);
+    const reply = openClawReply(parsed, out);
     updateAgentRun(key, id, { status: rc === 0 ? 'succeeded' : 'failed', rc, completedAt: now(), output: shortText(reply, 6000), error: shortText(err, 3000), rawJson: parsed ? parsed : undefined }).catch(()=>{});
   });
   return entry;
