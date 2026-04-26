@@ -154,6 +154,8 @@ function renderLoop() {
       </form>
     </section>
     <section class="card"><h2>Status</h2>${autopilotStatus(l.autopilot)}</section>
+    <section class="card"><h2>Learnings / self-improvement</h2>${learningList(l.learnings)}${promptRevisions(l.promptRevisions)}</section>
+    <section class="card"><h2>Latest evaluation</h2>${evaluation((l.evaluations || []).at(-1))}</section>
     <section class="card"><h2>Real OpenClaw runs</h2>${agentRuns(l.agentRuns)}</section>
     <section class="card"><h2>Repo status</h2><p class="mono muted">${esc(s.git.branch)} @ ${esc(s.git.head)} · ${s.git.dirtyFiles ?? '?'} dirty file(s)</p>${(s.git.recentCommits||[]).map(c=>`<div class="mono">${esc(c)}</div>`).join('')}</section>`;
 }
@@ -173,8 +175,12 @@ function evaluation(ev) {
   return `<div class="score ${scoreClass(ev.score)}">${ev.score}/100</div><p>${esc(ev.summary)}</p><p><strong>Best supervisor:</strong> ${esc(ev.bestVariant || 'n/a')}</p><p><strong>Correctness:</strong> ${ev.metrics?.correctness || 0}/100 · <strong>Cost:</strong> ${ev.metrics?.cost || 0}/100 · <strong>Requests:</strong> ${ev.metrics?.requests || 0}/100 · <strong>Duration:</strong> ${ev.metrics?.duration || 0}/100</p><p class="muted mono">tokens≈${ev.usage?.estimatedTokens || 0} · requests=${ev.usage?.requestCount || 0} · duration=${ev.usage?.durationSeconds || 0}s · cost≈$${ev.usage?.estimatedCostUsd || 0}</p><ul>${(ev.gaps||[]).map(g=>`<li>${esc(g)}</li>`).join('')}</ul><p class="muted mono">${esc(ev.ts)}</p>`;
 }
 function learningList(items=[]) {
-  if (!items.length) return '<p class="muted">The loop will capture learning after evaluation/replan cycles.</p>';
-  return `<ul>${items.slice(-5).reverse().map(x => `<li>${esc(x.claim)} <span class="muted">(${x.score}/100)</span></li>`).join('')}</ul>`;
+  if (!items.length) return '<p class="muted">No learning records yet. Real runs write here after completion.</p>';
+  return `<ul>${items.slice(-5).reverse().map(x => `<li>${esc(x.claim)} <span class="muted">(${x.score}/100 · ${esc(x.source || 'eval')})</span></li>`).join('')}</ul>`;
+}
+function promptRevisions(items=[]) {
+  if (!items.length) return '<p class="muted">No prompt revisions yet.</p>';
+  return `<details><summary>${items.length} prompt revision(s)</summary><ul>${items.slice(-5).reverse().map(x => `<li>${esc(x.reason || 'Prompt improved.')} <span class="muted mono">${esc(x.ts || '')}</span></li>`).join('')}</ul></details>`;
 }
 function renderHistory() {
   const h = state.snapshot.loop.history || [];

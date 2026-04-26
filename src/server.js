@@ -166,7 +166,7 @@ function stageSummary(stage, loop) {
   if (stage === 'supervisors') return `${loop.variants.length || loop.variantCount} supervisor variant(s) competing on the same request.`;
   if (stage === 'subagents') return 'Each supervisor spawns and manages its own sub-agent team.';
   if (stage === 'evaluate') return `Overall ${loop.score}/100 · correctness ${loop.metrics?.correctness || 0}/100 · duration ${loop.metrics?.duration || 0}/100.`;
-  return `${loop.promptRevisions.length} prompt/guidance revision(s).`;
+  return `${(loop.learnings || []).length} learning(s), ${loop.promptRevisions.length} prompt/guidance revision(s).`;
 }
 function acceptanceCriteria(intent) {
   const trimmed = intent.trim();
@@ -252,6 +252,98 @@ async function updateAgentRun(projectKeyValue, id, patch) {
   await writeJson(STATE_FILE, all);
   return loop;
 }
+function extractBulletsAfter(text, heading, max = 8) {
+  const lines = String(text || '').split(/\r?\n/);
+  const start = lines.findIndex(line => line.toLowerCase().includes(heading.toLowerCase()));
+  if (start < 0) return [];
+  const out = [];
+  for (const line of lines.slice(start + 1)) {
+    if (/^\s*(\*\*)?[A-Z][A-Za-z /]+:?\*?\*?\s*$/.test(line) && out.length) break;
+    const m = line.match(/^\s*[-*]\s+(.+)/);
+    if (m) out.push(m[1].trim());
+    if (out.length >= max) break;
+  }
+  return out;
+}
+function firstSectionLine(text, heading) {
+  const lines = String(text || '').split(/\r?\n/);
+  const start = lines.findIndex(line => line.toLowerCase().includes(heading.toLowerCase()));
+  if (start < 0) return '';
+  for (const line of lines.slice(start + 1)) {
+    const cleaned = line.replace(/^\s*[-*]\s*/, '').trim();
+    if (cleaned) return cleaned;
+  }
+  return '';
+}
+function promptHasRule(prompt, needle) { return String(prompt || '').toLowerCase().includes(String(needle || '').toLowerCase()); }
+function appendLearnedRule(prompt, rule) {
+  if (promptHasRule(prompt, rule)) return prompt;
+  return `${String(prompt || '').trim()}\n\nLearned supervisor rules:\n- ${rule}`;
+}
+function realRunFacts(reply, rc) {
+  const text = String(reply || '');
+  const lower = text.toLowerCase();
+  const files = extractBulletsAfter(text, 'files changed');
+  const validation = extractBulletsAfter(text, 'validation');
+  const next = firstSectionLine(text, 'next');
+  const blockers = firstSectionLine(text, 'blockers');
+  const validationPassed = /✅|\bpassed\b|\bpassing\b|0 fail|\d+\/\d+ passing/i.test(text);
+  const noBlockers = !blockers || /\bnone\b|no blockers|not blocked/i.test(blockers);
+  const changed = files.length > 0 && !files.some(x => /^none\.?$/i.test(x));
+  const score = rc === 0 ? Math.min(100, 50 + (validationPassed ? 25 : 0) + (noBlockers ? 10 : 0) + (changed ? 10 : 0) + (next ? 5 : 0)) : 25;
+  return { files, validation, next, blockers: blockers || (noBlockers ? 'None reported' : ''), validationPassed, noBlockers, changed, score, text: shortText(text, 1200), lower };
+}
+function applyRealRunLearning(loop, run) {
+  const facts = realRunFacts(run.reply, run.rc);
+  const succeeded = run.rc === 0;
+  const metrics = {
+    correctness: facts.score,
+    cost: 70,
+    requests: 85,
+    duration: 75,
+  };
+  loop.metrics = metrics;
+  loop.score = facts.score;
+  loop.supervisorScore = Math.max(loop.supervisorScore || 0, facts.score);
+  loop.subAgentScore = Math.max(loop.subAgentScore || 0, facts.validationPassed ? 70 : 45);
+  const ev = {
+    ts: now(),
+    cycle: loop.cycle || 0,
+    source: 'real-agent-run',
+    runId: run.id,
+    sessionId: run.sessionId,
+    score: facts.score,
+    metrics,
+    summary: succeeded ? 'Real OpenClaw run completed; extracted result quality signals from final report.' : 'Real OpenClaw run failed; inspect stderr/output before continuing.',
+    evidence: {
+      filesChanged: facts.files,
+      validation: facts.validation,
+      blockers: facts.blockers,
+      nextRecommendation: facts.next,
+    },
+    gaps: [
+      ...(facts.validationPassed ? [] : ['Final report did not clearly show passing validation; require explicit test/check results.']),
+      ...(facts.noBlockers ? [] : [`Run reported blocker: ${facts.blockers}`]),
+      ...(facts.changed ? [] : ['Run reported no file changes; ensure the next run has a concrete acceptance slice.']),
+    ],
+  };
+  loop.evaluations = [...(loop.evaluations || []), ev].slice(-50);
+  const claim = succeeded
+    ? `Run ${run.id} completed a coherent slice${facts.validationPassed ? ' with validation' : ''}${facts.next ? `; next slice: ${facts.next}` : '.'}`
+    : `Run ${run.id} failed; use stderr/output as the next debugging target.`;
+  loop.learnings = [...(loop.learnings || []), { ts: now(), cycle: loop.cycle || 0, source: 'real-agent-run', runId: run.id, claim, score: facts.score, evidence: ev.evidence }].slice(-50);
+  const revisions = [];
+  if (!facts.validationPassed) revisions.push('Final reports must include exact validation commands and pass/fail results before a run counts as complete.');
+  if (!facts.next) revisions.push('Final reports must include one concrete next recommended slice.');
+  if (succeeded && facts.changed && !/push(ed)?\b|origin\/main|pushing is blocked/i.test(facts.lower)) revisions.push('When changing a git repo, commit and push verified changes when an origin remote is configured; otherwise report the push blocker explicitly.');
+  for (const rule of revisions) {
+    const before = loop.supervisorPrompt;
+    loop.supervisorPrompt = appendLearnedRule(loop.supervisorPrompt, rule);
+    if (before !== loop.supervisorPrompt) loop.promptRevisions = [...(loop.promptRevisions || []), { ts: now(), cycle: loop.cycle || 0, source: 'real-agent-run', runId: run.id, reason: rule, fromScore: facts.score }].slice(-50);
+  }
+  loop.stage = 'improve';
+  loop.cycle = (loop.cycle || 0) + 1;
+}
 function requireAgentAuth(req) {
   if (!AGENT_RUNS_ENABLED) throw Object.assign(new Error('Real OpenClaw agent runs are disabled on this server. Set OPENCLAW_AGENT_RUNS=1 and OPENCLAW_AGENT_TOKEN to enable them.'), { status: 503 });
   if (!AGENT_RUN_TOKEN) throw Object.assign(new Error('OPENCLAW_AGENT_TOKEN is required before enabling public agent launches.'), { status: 503 });
@@ -279,7 +371,7 @@ async function startAgentRun(host, repoPath, body = {}) {
     `User request / intent:`,
     message,
     ``,
-    `Work directly in that repo when the request calls for code or file changes. Return a concise final report with files changed, validation performed, blockers, and next recommendation.`
+    `Work directly in that repo when the request calls for code or file changes. Prefer one coherent, tested slice over tiny changes. If you modify a git repo, commit the verified changes and push when an origin remote is configured and credentials are available; if pushing is blocked, say so explicitly. Return a concise final report with files changed, validation performed, blockers, and next recommendation.`
   ].join('\n');
   const bin = process.env.OPENCLAW_BIN || 'openclaw';
   const args = ['agent', '--session-id', sessionId, '--message', prompt, '--thinking', thinking, '--timeout', timeout, '--json'];
@@ -308,10 +400,12 @@ async function startAgentRun(host, repoPath, body = {}) {
       const succeeded = rc === 0;
       latest.status = remaining ? 'agent running' : (succeeded ? 'agent completed' : 'agent failed');
       latest.stage = remaining ? latest.stage : (succeeded ? 'evaluate' : 'subagents');
-      latest.history = [...(latest.history || []), { ts: now(), event: succeeded ? 'agent_completed' : 'agent_failed', id, rc, sessionId }].slice(-80);
+      const runPatch = { status: succeeded ? 'succeeded' : 'failed', rc, completedAt: now(), output: shortText(reply, 6000), error: succeeded ? '' : shortText(err, 3000), warnings: succeeded ? shortText(err, 3000) : '', rawJson: parsed ? parsed : undefined };
+      latest.agentRuns = (latest.agentRuns || []).map(r => r.id === id ? { ...r, ...runPatch, updatedAt: now() } : r);
+      applyRealRunLearning(latest, { id, rc, reply, err, parsed, sessionId });
+      latest.history = [...(latest.history || []), { ts: now(), event: succeeded ? 'agent_completed' : 'agent_failed', id, rc, sessionId }].slice(-100);
       all.projects[key] = latest;
       await writeJson(STATE_FILE, all);
-      await updateAgentRun(key, id, { status: succeeded ? 'succeeded' : 'failed', rc, completedAt: now(), output: shortText(reply, 6000), error: succeeded ? '' : shortText(err, 3000), warnings: succeeded ? shortText(err, 3000) : '', rawJson: parsed ? parsed : undefined });
     })().catch(e => logError('agent.close.update_failed', e, { id, repo, sessionId }));
   });
   return entry;
